@@ -1,107 +1,131 @@
 # npm-reorg-guard
 
-> 블록체인 reorg 개념을 npm 패키지 보안에 적용한 Claude Code 스킬
+> Blockchain reorg meets npm security -- snapshot, verify, and auto-rollback suspicious package installs in Claude Code.
 
-## 개념
+## Why "reorg"?
 
-블록체인에서 **reorg(reorganization)** 는 특정 블록 이후의 체인을 무효화하고, 이전의 안전한 상태로 되돌리는 메커니즘입니다.
+In blockchain networks, a **reorganization (reorg)** invalidates a sequence of blocks and reverts the chain to a previously confirmed safe state. `npm-reorg-guard` applies the same principle to your `node_modules`: every `npm install` is treated as an unconfirmed block candidate until it passes a battery of supply-chain security checks. If anything looks wrong, the tool performs a **reorg** -- rolling back lock files, `package.json`, and `node_modules` to the last confirmed safe snapshot.
 
-`npm-reorg-guard`는 이 개념을 npm 패키지 관리에 적용합니다:
+No manual review. No leftover malicious code. Fully automatic.
+
+## How It Works
+
+`npm-reorg-guard` plugs into [Claude Code's hook system](https://docs.anthropic.com/en/docs/claude-code/hooks) as a pair of **PreToolUse** and **PostToolUse** hooks that wrap every package install command.
 
 ```
-[confirmed 상태] → npm install → [pending snapshot] → 검증 통과 → [confirmed 상태]
-       ↑                               │
-       └──── 마지막 confirmed snapshot ┘
-                                       └─ 검증 실패 → REORG → [confirmed 상태]
+                         PreToolUse                          PostToolUse
+                        (guard.sh)                          (verify.sh)
+                            |                                    |
+  npm install ──> [ Pre-flight checks ] ──> [ Execute ] ──> [ Verify ]
+                     |            |                           |       |
+                  Block if      Snapshot                   Clean?  Suspicious?
+                  suspicious    lock files,                  |       |
+                               package.json,              Confirm  REORG
+                               node_modules list            |       |
+                                    |                       v       v
+                                    +--- parent_snapshot_id ──> confirmed
+                                                                    |
+                                                              Rollback to last
+                                                              confirmed snapshot
 ```
 
-1. **스냅샷 (Block Checkpoint)**: `npm install` 실행 전, 현재 lock 파일의 해시와 사본을 저장하고 `_meta.json`에 `parent_snapshot_id`를 기록합니다.
-2. **검증 (Block Validation)**: 설치 후, 변경된 lock 파일과 새 패키지들을 보안 규칙으로 검증합니다.
-3. **확정 (Block Confirmation)**: 검증이 통과하면 해당 스냅샷 ID를 `~/.npm-reorg-guard/confirmed`에 기록해 finality를 부여합니다.
-4. **리오그 (Chain Reorganization)**: 의심스러운 변경이 감지되면, 직전 pending 상태가 아니라 마지막 confirmed 스냅샷으로 자동 롤백합니다.
+### Phase 1: Pre-flight (guard.sh -- PreToolUse)
 
-## 동작 방식
+When Claude Code is about to run `npm install`, `pnpm add`, `yarn add`, or similar commands, the guard hook:
 
-Claude Code의 Hook 시스템을 활용합니다.
+1. **Snapshots** the current `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, and `package.json` into `~/.npm-reorg-guard/snapshots/`.
+2. **Records metadata** including a `parent_snapshot_id` linking to the previous confirmed snapshot (forming a chain, just like blocks).
+3. **Captures pre-install state** of `node_modules` (package listings and binary listings) for diff-based detection later.
+4. **Runs pre-flight checks** and **blocks** the command entirely if it detects:
+   - Typosquatting package names (`lod_sh`, `reacct`, `axois`, etc.)
+   - Non-standard `--registry` URLs (anything outside `registry.npmjs.org` and `registry.yarnpkg.com`)
+   - Piped remote execution patterns (`curl ... | bash`)
+   - Explicit disabling of install script safety (`npm config set ignore-scripts false`)
 
-### PreToolUse 훅 — `guard.sh`
+If a pre-flight check fails, the command is **blocked before execution** -- nothing is installed.
 
-Claude가 `npm install`, `pnpm add` 등의 명령을 실행하기 **직전**에 가로챕니다.
+### Phase 2: Post-install verification (verify.sh -- PostToolUse)
 
-**하는 일:**
-- 현재 `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `package.json`을 `~/.npm-reorg-guard/snapshots/`에 저장
-- 각 lock 파일의 SHA-256 해시도 함께 저장 (PostToolUse에서 비교용)
-- 스냅샷 메타데이터(`_meta.json`)에 타임스탬프, 프로젝트 경로, 실행 명령어, `parent_snapshot_id` 기록
-- `current_snapshot_id`, `current_project_dir`, `confirmed` 상태 파일은 lock 디렉토리로 경쟁 상태를 방지하며 기록
+After the install command completes, the verify hook analyzes what changed:
 
-**사전 차단하는 패턴 (block):**
-| 패턴 | 이유 |
-|------|------|
-| `curl \| bash` 형태의 파이프 실행 | 원격 스크립트 직접 실행 |
-| `npm config set ignore-scripts false` | install 스크립트 강제 활성화 |
-| `--registry` 옵션이 `registry.npmjs.org`, `registry.yarnpkg.com` 외를 가리킴 | 악성 레지스트리 사용 시도 |
-| `lod_sh`, `reacct`, `axois` 등 타이포스쿼팅 패턴 | 알려진 오타 악용 패키지명 |
+1. **Install script analysis** -- Scans newly added packages for `preinstall`, `install`, and `postinstall` scripts containing:
+   - Network access (`curl`, `wget`, `fetch`, `http`, `socket`, `dns`)
+   - Dynamic code execution (`eval`, `exec`, `spawn`, `child_process`, `Function()`)
+   - Sensitive path access (`~/.ssh`, `.env`, `.aws`, `credentials`)
+   - Obfuscated content (`base64`, `atob`, `Buffer.from`, hex/unicode escapes)
 
-의심 패턴이 감지되면 `{"decision": "block", ...}`을 반환해 명령 자체를 실행하지 않습니다.
-`jq`가 없으면 훅은 경고를 출력하고 종료합니다.
+2. **Lock file diff analysis** -- Compares the snapshotted lock file content against the post-install version:
+   - Resolved URLs pointing to non-standard registries
+   - Insecure protocols (`http://`, `git://`) in resolved URLs
+   - Unusually large dependency additions (>50 new resolved entries, indicating potential dependency confusion)
 
----
+3. **Binary inspection** -- Checks `node_modules/.bin/` for newly added native binaries (ELF, Mach-O, shared objects) that should not appear in a JavaScript project.
 
-### PostToolUse 훅 — `verify.sh`
+### Phase 3: Confirm or Reorg
 
-`npm install` 완료 **직후** 변경 사항을 분석합니다.
+- **All checks pass** -- The snapshot is marked as **confirmed** in `~/.npm-reorg-guard/confirmed`. This becomes the new safe baseline.
+- **Any check fails** -- A **reorg** is triggered:
+  1. Lock files are restored from the last confirmed snapshot.
+  2. `package.json` is restored if it was modified.
+  3. `node_modules` is rebuilt via `npm ci` (or `npm install` as fallback) to purge any malicious artifacts.
+  4. The event is logged to `~/.npm-reorg-guard/reorg.log`.
+  5. Claude Code receives a system message detailing the detected threats and rollback actions.
 
-**하는 일:**
+## The Blockchain Analogy
 
-1. **postinstall 스크립트 검사** (`check_postinstall_scripts`)
-   - `_meta.json`보다 최신인 `node_modules/*/package.json`을 최대 50개 스캔
-   - 각 패키지의 `preinstall`, `install`, `postinstall` 스크립트 내용을 분석
-   - 아래 패턴 발견 시 `SUSPICIOUS=true` 플래그 설정:
-     - 네트워크 접근: `curl`, `wget`, `fetch`, `http`, `socket` 등
-     - 코드 실행: `eval`, `exec`, `spawn`, `child_process`, `Function()` 등
-     - 민감 경로 접근: `.ssh`, `.env`, `.aws`, `credentials` 등
-     - 난독화: `base64`, `atob`, `Buffer.from`, hex/unicode escape 등
+| Blockchain Concept | npm-reorg-guard Equivalent |
+|---|---|
+| **Block candidate** | Snapshot taken before `npm install` |
+| **Block validation** | Post-install security checks (scripts, lock diff, binaries) |
+| **Finality / confirmation** | Snapshot ID written to `~/.npm-reorg-guard/confirmed` |
+| **Chain reorganization** | Rollback to last confirmed snapshot + `node_modules` rebuild |
+| **Parent hash linking** | `parent_snapshot_id` in each snapshot's `_meta.json` |
+| **Chain pruning** | Old unconfirmed snapshots cleaned up, confirmed chain preserved |
 
-2. **lock 파일 diff 검사** (`check_lockfile_diff`)
-   - 스냅샷 내용과 현재 lock 파일 내용을 직접 비교해 변경 여부 확인
-   - 변경된 경우 diff를 분석:
-     - 공식 레지스트리(`registry.npmjs.org`, `registry.yarnpkg.com`) 외 `resolved` URL → 의심
-     - `git://` 또는 `http://`(비HTTPS) resolved URL → 의심
-     - 새로 추가된 `resolved` 항목이 50개 초과 → 의존성 폭발 의심
+## Detection Rules
 
-3. **네이티브 바이너리 검사** (`check_binaries`)
-   - `node_modules/.bin/` 내 `_meta.json`보다 새로 생긴 파일 스캔
-   - `file` 명령으로 ELF, Mach-O, 실행 가능한 바이너리 판별 → 의심
+| Category | What it catches | Phase | Action |
+|---|---|---|---|
+| Typosquatting | Known misspelling patterns of popular packages | Pre-flight | **Block** |
+| Pipe execution | `curl \| bash`, `wget \| sh` | Pre-flight | **Block** |
+| Registry hijack | `--registry` pointing to unofficial sources | Pre-flight | **Block** |
+| Script safety bypass | `npm config set ignore-scripts false` | Pre-flight | **Block** |
+| Malicious install scripts | Network calls, `eval`/`exec`, sensitive path access in hooks | Post-install | **Reorg** |
+| Obfuscated code | Base64, hex encoding, `Buffer.from` in install scripts | Post-install | **Reorg** |
+| Lock file tampering | Resolved URLs from non-standard registries | Post-install | **Reorg** |
+| Insecure protocols | `http://` or `git://` resolved URLs | Post-install | **Reorg** |
+| Dependency confusion | >50 new dependencies in a single install | Post-install | **Reorg** |
+| Native binaries | Compiled executables in `node_modules/.bin/` | Post-install | **Reorg** |
 
-**REORG 실행 조건:**
-`SUSPICIOUS=true`가 하나라도 설정되면:
-- 마지막 confirmed 스냅샷에서 lock 파일들을 현재 위치로 복원 (confirmed가 없으면 현재 pending snapshot 사용)
-- `package.json`도 변경된 경우 실제 해시 비교 후 복원
-- `npm ci` 또는 `rm -rf node_modules && npm install`로 `node_modules`를 다시 설치해 악성 코드 잔존을 방지
-- `~/.npm-reorg-guard/reorg.log`에 이벤트 기록
-- Claude에게 `systemMessage`로 감지 내용과 롤백된 파일 목록 전달
+## Installation
 
-이상이 없으면 해당 스냅샷을 자동으로 confirm 하고 종료합니다.
-오래된 스냅샷 정리는 성공 경로와 reorg 경로 모두에서 실행되며, 최근 10개의 비확정 스냅샷만 정리하고 confirmed 체인은 보존합니다.
+### Prerequisites
 
-## 설치
-
-### 사전 요구사항
-
-- Claude Code (Hook 지원 버전)
-- `jq` (JSON 파서)
-- `shasum` 또는 `sha256sum`
-
-### 설정 방법
-
-1. 레포지토리를 클론합니다:
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with hook support
+- `jq` -- JSON parsing (hooks exit gracefully if missing)
+- `shasum` or `sha256sum` -- hash computation
+- `file` (optional) -- binary detection
 
 ```bash
-git clone https://github.com/aldegad/npm-reorg-guard.git
+# macOS
+brew install jq
+
+# Ubuntu / Debian
+sudo apt-get install jq
+```
+
+### Setup
+
+**1. Clone the repository:**
+
+```bash
+git clone https://github.com/soohongkim/npm-reorg-guard.git
 cp -r npm-reorg-guard ~/.claude/skills/
 ```
 
-2. `.claude/settings.json`에 훅을 추가합니다:
+**2. Add hooks to your Claude Code settings:**
+
+Edit `.claude/settings.json` (project-level) or `~/.claude/settings.json` (global):
 
 ```json
 {
@@ -109,58 +133,81 @@ cp -r npm-reorg-guard ~/.claude/skills/
     "PreToolUse": [
       {
         "matcher": "Bash",
-        "hook": "~/.claude/skills/npm-reorg-guard/scripts/guard.sh"
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/skills/npm-reorg-guard/scripts/guard.sh"
+          }
+        ]
       }
     ],
     "PostToolUse": [
       {
         "matcher": "Bash",
-        "hook": "~/.claude/skills/npm-reorg-guard/scripts/verify.sh"
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/skills/npm-reorg-guard/scripts/verify.sh"
+          }
+        ]
       }
     ]
   }
 }
 ```
 
-3. 실행 권한 확인:
+**3. Verify permissions:**
 
 ```bash
-ls -la ~/.claude/skills/npm-reorg-guard/scripts/
+chmod +x ~/.claude/skills/npm-reorg-guard/scripts/guard.sh
+chmod +x ~/.claude/skills/npm-reorg-guard/scripts/verify.sh
 ```
 
-## 로그 및 스냅샷
+That's it. The guard activates automatically whenever Claude Code runs a package install command.
 
-- **Reorg 로그**: `~/.npm-reorg-guard/reorg.log`
-- **Confirmed snapshot**: `~/.npm-reorg-guard/confirmed`
-- **스냅샷**: `~/.npm-reorg-guard/snapshots/`
-- 최근 10개의 비확정 스냅샷만 자동 정리되며 confirmed 체인은 유지됩니다
+## Real-World Attack Coverage
+
+`npm-reorg-guard` is designed to catch the patterns behind real supply-chain incidents:
+
+- **`event-stream` (2018)** -- Malicious `postinstall` script with obfuscated code that exfiltrated cryptocurrency wallet keys. Caught by: install script analysis (obfuscation + network access detection).
+- **`ua-parser-js` hijack (2021)** -- Compromised package added a `preinstall` script that downloaded and executed cryptominers. Caught by: install script analysis (network access + code execution).
+- **`colors` / `faker` sabotage (2022)** -- While these were author-initiated, the abnormal dependency behavior would trigger the dependency explosion check.
+- **Typosquatting campaigns** -- Ongoing campaigns publishing packages like `crossenv` (instead of `cross-env`) or `babelcli` (instead of `babel-cli`). Caught by: pre-flight typosquatting pattern matching.
+- **Dependency confusion attacks** -- Internal package names published to the public registry with higher version numbers. Caught by: non-standard registry detection + large dependency count changes.
+
+## Logs and Snapshots
+
+| Path | Description |
+|---|---|
+| `~/.npm-reorg-guard/reorg.log` | Full reorg event history with timestamps, reasons, and rolled-back files |
+| `~/.npm-reorg-guard/confirmed` | Current confirmed (safe) snapshot ID |
+| `~/.npm-reorg-guard/snapshots/` | All snapshot files (lock files, package.json copies, metadata) |
 
 ```bash
-# Reorg 이력 확인
+# View reorg history
 cat ~/.npm-reorg-guard/reorg.log
 
-# 마지막 confirmed snapshot 확인
+# Check current confirmed snapshot
 cat ~/.npm-reorg-guard/confirmed
 
-# 스냅샷 목록 확인
+# List all snapshots
 ls -la ~/.npm-reorg-guard/snapshots/
 ```
 
-## 탐지 규칙 요약
+Old unconfirmed snapshots are automatically pruned (keeping the 10 most recent), while the confirmed snapshot chain is always preserved.
 
-| 카테고리 | 패턴 | 대응 |
-|----------|------|------|
-| 타이포스쿼팅 | 알려진 오타 패턴 | 차단 (PreToolUse) |
-| 파이프 실행 | `curl \| bash` | 차단 (PreToolUse) |
-| 비표준 레지스트리 | 공식 레지스트리 외 `--registry` 옵션 | 차단 (PreToolUse) |
-| 악성 install 스크립트 | postinstall 내 네트워크 접근 | 리오그 (PostToolUse) |
-| 코드 실행 | eval/exec in install script | 리오그 (PostToolUse) |
-| 민감 경로 접근 | .ssh, .env, .aws | 리오그 (PostToolUse) |
-| 난독화 코드 | base64, hex 인코딩 | 리오그 (PostToolUse) |
-| 의존성 폭발 | 50개 이상 새 의존성 | 리오그 (PostToolUse) |
-| 네이티브 바이너리 | node_modules 내 컴파일된 실행파일 | 리오그 (PostToolUse) |
-| 비보안 URL | http:// 또는 git:// resolved URL | 리오그 (PostToolUse) |
+## Project Structure
 
-## 라이선스
+```
+npm-reorg-guard/
+  scripts/
+    guard.sh      # PreToolUse hook -- snapshot + pre-flight checks
+    verify.sh     # PostToolUse hook -- post-install verification + reorg
+  package.json
+  skill.md        # Claude Code skill manifest
+  LICENSE         # Apache-2.0
+```
 
-Apache License 2.0 — 자세한 내용은 [LICENSE](LICENSE)를 참고하세요.
+## License
+
+[Apache License 2.0](LICENSE)
