@@ -1,65 +1,101 @@
 # npm-reorg-guard
 
-> Blockchain reorg concept applied to npm package security for Claude Code
+> 블록체인 reorg 개념을 npm 패키지 보안에 적용한 Claude Code 스킬
 
-## Concept
+## 개념
 
 블록체인에서 **reorg(reorganization)** 는 특정 블록 이후의 체인을 무효화하고, 이전의 안전한 상태로 되돌리는 메커니즘입니다.
 
 `npm-reorg-guard`는 이 개념을 npm 패키지 관리에 적용합니다:
 
 ```
-[Safe State] → npm install → [New State] → 검증 실패 → REORG → [Safe State]
+[안전 상태] → npm install → [새 상태] → 검증 실패 → REORG → [안전 상태]
      ↑                                                           ↑
      └── package-lock.json 스냅샷 ─────────────────── 롤백 ──────┘
 ```
 
-1. **스냅샷 (Block Checkpoint)**: `npm install` 실행 전, 현재 `package-lock.json`의 해시와 사본을 저장합니다.
+1. **스냅샷 (Block Checkpoint)**: `npm install` 실행 전, 현재 lock 파일의 해시와 사본을 저장합니다.
 2. **검증 (Block Validation)**: 설치 후, 변경된 lock 파일과 새 패키지들을 보안 규칙으로 검증합니다.
 3. **리오그 (Chain Reorganization)**: 의심스러운 변경이 감지되면, 스냅샷으로 자동 롤백합니다.
 
-## How It Works
+## 동작 방식
 
-Claude Code의 Hook 시스템을 활용합니다:
+Claude Code의 Hook 시스템을 활용합니다.
 
-### PreToolUse Hook (`guard.sh`)
+### PreToolUse 훅 — `guard.sh`
 
-- Claude가 `npm install`, `pnpm add` 등의 명령을 실행하기 전에 가로챕니다
-- 현재 lock 파일의 안전 스냅샷을 `~/.npm-reorg-guard/snapshots/`에 저장합니다
-- 명령 자체의 위험성도 사전 검사합니다:
-  - 원격 스크립트 파이프 실행 (`curl | bash`)
-  - 비표준 레지스트리 사용
-  - 타이포스쿼팅 패턴 패키지명
+Claude가 `npm install`, `pnpm add` 등의 명령을 실행하기 **직전**에 가로챕니다.
 
-### PostToolUse Hook (`verify.sh`)
+**하는 일:**
+- 현재 `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `package.json`을 `~/.npm-reorg-guard/snapshots/`에 저장
+- 각 lock 파일의 SHA-256 해시도 함께 저장 (PostToolUse에서 비교용)
+- 스냅샷 메타데이터(`_meta.json`)에 타임스탬프, 프로젝트 경로, 실행 명령어 기록
 
-- `npm install` 완료 후, 변경 사항을 분석합니다
-- 감지하는 위협 패턴:
-  - **악성 install 스크립트**: `postinstall`, `preinstall`에서 네트워크 접근, 코드 실행, 민감 경로 접근
-  - **비표준 레지스트리**: `resolved` URL이 공식 npm 레지스트리가 아닌 곳을 가리킴
-  - **난독화 코드**: base64 인코딩, hex escape 등
-  - **의존성 폭발**: 비정상적으로 많은 새 의존성 추가
-  - **네이티브 바이너리**: node_modules 내 컴파일된 실행 파일
-- 위협 감지 시 자동으로 스냅샷 상태로 롤백(reorg)합니다
+**사전 차단하는 패턴 (block):**
+| 패턴 | 이유 |
+|------|------|
+| `curl \| bash` 형태의 파이프 실행 | 원격 스크립트 직접 실행 |
+| `npm config set ignore-scripts false` | install 스크립트 강제 활성화 |
+| `--registry` 옵션으로 비표준 레지스트리 지정 | 악성 레지스트리 사용 시도 |
+| `lod_sh`, `reacct`, `axois` 등 타이포스쿼팅 패턴 | 알려진 오타 악용 패키지명 |
 
-## Installation
+의심 패턴이 감지되면 `{"decision": "block", ...}`을 반환해 명령 자체를 실행하지 않습니다.
 
-### Prerequisites
+---
 
-- Claude Code (with Hook support)
-- `jq` (JSON parser)
-- `shasum` or `sha256sum`
+### PostToolUse 훅 — `verify.sh`
 
-### Setup
+`npm install` 완료 **직후** 변경 사항을 분석합니다.
 
-1. Clone this repository:
+**하는 일:**
+
+1. **postinstall 스크립트 검사** (`check_postinstall_scripts`)
+   - `_meta.json`보다 최신인 `node_modules/*/package.json`을 최대 50개 스캔
+   - 각 패키지의 `preinstall`, `install`, `postinstall` 스크립트 내용을 분석
+   - 아래 패턴 발견 시 `SUSPICIOUS=true` 플래그 설정:
+     - 네트워크 접근: `curl`, `wget`, `fetch`, `http`, `socket` 등
+     - 코드 실행: `eval`, `exec`, `spawn`, `child_process`, `Function()` 등
+     - 민감 경로 접근: `.ssh`, `.env`, `.aws`, `credentials` 등
+     - 난독화: `base64`, `atob`, `Buffer.from`, hex/unicode escape 등
+
+2. **lock 파일 diff 검사** (`check_lockfile_diff`)
+   - SHA-256 해시를 비교해 lock 파일 변경 여부 확인
+   - 변경된 경우 diff를 분석:
+     - 공식 레지스트리(`registry.npmjs.org`, `registry.yarnpkg.com`) 외 `resolved` URL → 의심
+     - `git://` 또는 `http://`(비HTTPS) resolved URL → 의심
+     - 새로 추가된 `resolved` 항목이 50개 초과 → 의존성 폭발 의심
+
+3. **네이티브 바이너리 검사** (`check_binaries`)
+   - `node_modules/.bin/` 내 `_meta.json`보다 새로 생긴 파일 스캔
+   - `file` 명령으로 ELF, Mach-O, 실행 가능한 바이너리 판별 → 의심
+
+**REORG 실행 조건:**
+`SUSPICIOUS=true`가 하나라도 설정되면:
+- 스냅샷에서 lock 파일들을 현재 위치로 복원 (rollback)
+- `package.json`도 변경된 경우 복원
+- `~/.npm-reorg-guard/reorg.log`에 이벤트 기록
+- Claude에게 `systemMessage`로 감지 내용과 롤백된 파일 목록 전달
+
+이상이 없으면 오래된 스냅샷을 정리하고 종료합니다 (최근 10개 유지).
+
+## 설치
+
+### 사전 요구사항
+
+- Claude Code (Hook 지원 버전)
+- `jq` (JSON 파서)
+- `shasum` 또는 `sha256sum`
+
+### 설정 방법
+
+1. 레포지토리를 클론합니다:
 
 ```bash
 git clone https://github.com/your-org/npm-reorg-guard.git
 cp -r npm-reorg-guard ~/.claude/skills/
 ```
 
-2. Add hooks to `.claude/settings.json`:
+2. `.claude/settings.json`에 훅을 추가합니다:
 
 ```json
 {
@@ -80,42 +116,41 @@ cp -r npm-reorg-guard ~/.claude/skills/
 }
 ```
 
-3. Verify installation:
+3. 실행 권한 확인:
 
 ```bash
-# guard.sh and verify.sh should be executable
 ls -la ~/.claude/skills/npm-reorg-guard/scripts/
 ```
 
-## Logs & Snapshots
+## 로그 및 스냅샷
 
-- **Reorg log**: `~/.npm-reorg-guard/reorg.log`
-- **Snapshots**: `~/.npm-reorg-guard/snapshots/`
-- Only the 10 most recent snapshots are retained
+- **Reorg 로그**: `~/.npm-reorg-guard/reorg.log`
+- **스냅샷**: `~/.npm-reorg-guard/snapshots/`
+- 최근 10개의 스냅샷만 유지됩니다
 
 ```bash
-# View reorg history
+# Reorg 이력 확인
 cat ~/.npm-reorg-guard/reorg.log
 
-# List snapshots
+# 스냅샷 목록 확인
 ls -la ~/.npm-reorg-guard/snapshots/
 ```
 
-## Detection Rules
+## 탐지 규칙 요약
 
-| Category | Pattern | Action |
-|----------|---------|--------|
-| Typosquatting | Known misspelling patterns | Block (PreToolUse) |
-| Pipe execution | `curl \| bash` | Block (PreToolUse) |
-| Non-standard registry | `--registry` with unknown host | Block (PreToolUse) |
-| Malicious install script | Network access in postinstall | Reorg (PostToolUse) |
-| Code execution | eval/exec in install script | Reorg (PostToolUse) |
-| Sensitive path access | .ssh, .env, .aws access | Reorg (PostToolUse) |
-| Obfuscated code | base64, hex encoding | Reorg (PostToolUse) |
-| Dependency explosion | 50+ new dependencies | Reorg (PostToolUse) |
-| Native binary | Compiled binary in node_modules | Reorg (PostToolUse) |
-| Insecure URL | http:// or git:// resolved URL | Reorg (PostToolUse) |
+| 카테고리 | 패턴 | 대응 |
+|----------|------|------|
+| 타이포스쿼팅 | 알려진 오타 패턴 | 차단 (PreToolUse) |
+| 파이프 실행 | `curl \| bash` | 차단 (PreToolUse) |
+| 비표준 레지스트리 | `--registry` 옵션 | 차단 (PreToolUse) |
+| 악성 install 스크립트 | postinstall 내 네트워크 접근 | 리오그 (PostToolUse) |
+| 코드 실행 | eval/exec in install script | 리오그 (PostToolUse) |
+| 민감 경로 접근 | .ssh, .env, .aws | 리오그 (PostToolUse) |
+| 난독화 코드 | base64, hex 인코딩 | 리오그 (PostToolUse) |
+| 의존성 폭발 | 50개 이상 새 의존성 | 리오그 (PostToolUse) |
+| 네이티브 바이너리 | node_modules 내 컴파일된 실행파일 | 리오그 (PostToolUse) |
+| 비보안 URL | http:// 또는 git:// resolved URL | 리오그 (PostToolUse) |
 
-## License
+## 라이선스
 
-Apache License 2.0 — see [LICENSE](LICENSE) for details.
+Apache License 2.0 — 자세한 내용은 [LICENSE](LICENSE)를 참고하세요.
