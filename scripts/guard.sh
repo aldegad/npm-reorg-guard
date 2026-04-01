@@ -122,6 +122,15 @@ if [[ -f "${PROJECT_DIR}/package.json" ]]; then
   cp "${PROJECT_DIR}/package.json" "${SNAPSHOT_DIR}/${SNAPSHOT_ID}_package.json"
 fi
 
+# Save pre-install listings for diff-based detection (avoids mtime-based find -newer)
+if [[ -d "${PROJECT_DIR}/node_modules" ]]; then
+  find "${PROJECT_DIR}/node_modules" -maxdepth 3 -name "package.json" 2>/dev/null | sort > "${SNAPSHOT_DIR}/${SNAPSHOT_ID}_packages.list"
+  ls "${PROJECT_DIR}/node_modules/.bin/" 2>/dev/null | sort > "${SNAPSHOT_DIR}/${SNAPSHOT_ID}_bins.list"
+else
+  touch "${SNAPSHOT_DIR}/${SNAPSHOT_ID}_packages.list"
+  touch "${SNAPSHOT_DIR}/${SNAPSHOT_ID}_bins.list"
+fi
+
 # Store metadata for PostToolUse verification
 cat > "${SNAPSHOT_DIR}/${SNAPSHOT_ID}_meta.json" << META_EOF
 {

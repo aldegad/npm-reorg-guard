@@ -90,7 +90,7 @@ read_confirmed_snapshot() {
   if [[ -f "${GUARD_DIR}/confirmed" ]]; then
     confirmed_snapshot=$(cat "${GUARD_DIR}/confirmed" 2>/dev/null || true)
   fi
-  release_state_lock
+  release_state_lock; STATE_LOCK_HELD=false
 
   printf '%s' "${confirmed_snapshot}"
 }
@@ -98,9 +98,9 @@ read_confirmed_snapshot() {
 confirm_snapshot() {
   local snapshot_id="$1"
 
-  acquire_state_lock
+  acquire_state_lock; STATE_LOCK_HELD=true
   write_state_file "${GUARD_DIR}/confirmed" "${snapshot_id}"
-  release_state_lock
+  release_state_lock; STATE_LOCK_HELD=false
 }
 
 collect_protected_snapshot_ids() {
@@ -215,8 +215,9 @@ if [[ "${TOOL_NAME}" != "Bash" ]]; then
   exit 0
 fi
 
+STATE_LOCK_HELD=true
 acquire_state_lock
-trap 'release_state_lock' EXIT
+trap '[ "${STATE_LOCK_HELD:-}" = "true" ] && release_state_lock; STATE_LOCK_HELD=false' EXIT
 
 # Check if we have a pending snapshot to verify
 if [[ ! -f "${GUARD_DIR}/current_snapshot_id" ]]; then
@@ -229,7 +230,7 @@ PROJECT_DIR=$(cat "${GUARD_DIR}/current_project_dir" 2>/dev/null || pwd)
 # Clean up current marker
 rm -f "${GUARD_DIR}/current_snapshot_id"
 rm -f "${GUARD_DIR}/current_project_dir"
-release_state_lock
+release_state_lock; STATE_LOCK_HELD=false
 
 # Verify snapshot exists
 META_FILE="${SNAPSHOT_DIR}/${SNAPSHOT_ID}_meta.json"
@@ -268,7 +269,12 @@ check_postinstall_scripts() {
   if [[ -d "${PROJECT_DIR}/node_modules" ]]; then
     # Find packages with postinstall/preinstall scripts
     local script_packages
-    script_packages=$(find "${PROJECT_DIR}/node_modules" -maxdepth 3 -name "package.json" -newer "${META_FILE}" 2>/dev/null | head -50)
+    local old_pkg_listing="${SNAPSHOT_DIR}/${SNAPSHOT_ID}_packages.list"
+    if [[ -f "${old_pkg_listing}" ]]; then
+      script_packages=$(find "${PROJECT_DIR}/node_modules" -maxdepth 3 -name "package.json" 2>/dev/null | sort | comm -13 "${old_pkg_listing}" - | head -50)
+    else
+      script_packages=$(find "${PROJECT_DIR}/node_modules" -maxdepth 3 -name "package.json" 2>/dev/null | head -50)
+    fi
 
     for pkg in ${script_packages}; do
       # Check for suspicious install hooks
@@ -368,7 +374,12 @@ check_binaries() {
   if [[ -d "${PROJECT_DIR}/node_modules/.bin" ]]; then
     # Check for newly added binaries that are actual compiled binaries (not scripts)
     local new_bins
-    new_bins=$(find "${PROJECT_DIR}/node_modules/.bin" -newer "${META_FILE}" -type f 2>/dev/null | head -20)
+    local old_bin_listing="${SNAPSHOT_DIR}/${SNAPSHOT_ID}_bins.list"
+    if [[ -f "${old_bin_listing}" ]]; then
+      new_bins=$(ls "${PROJECT_DIR}/node_modules/.bin/" 2>/dev/null | sort | comm -13 "${old_bin_listing}" - | head -20)
+    else
+      new_bins=$(ls "${PROJECT_DIR}/node_modules/.bin/" 2>/dev/null | head -20)
+    fi
 
     for bin in ${new_bins}; do
       # Check if it's a binary file (not a script)
