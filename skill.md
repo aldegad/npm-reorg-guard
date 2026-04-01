@@ -1,6 +1,6 @@
 ---
 name: npm-reorg-guard
-description: Blockchain reorg concept applied to npm package security — snapshots lock files before installs and auto-rollbacks on suspicious changes
+description: Blockchain reorg concept applied to npm package security — snapshots lock files before installs, confirms safe snapshots, and auto-rolls back suspicious changes
 hooks:
   - type: PreToolUse
     script: scripts/guard.sh
@@ -14,13 +14,14 @@ hooks:
 
 ## 작동 원리
 
-1. `npm install`, `pnpm add` 등 패키지 설치 명령 감지 시, 현재 lock 파일의 "안전 스냅샷"을 저장합니다.
-2. 설치 완료 후, 변경된 lock 파일을 분석하여 의심스러운 패턴을 탐지합니다.
-3. 의심스러운 변경이 발견되면 자동으로 이전 안전 상태로 롤백(reorg)합니다.
+1. `npm install`, `pnpm add` 등 패키지 설치 명령 감지 시, 현재 lock 파일의 "안전 스냅샷"을 저장하고 `_meta.json`에 `parent_snapshot_id`를 기록합니다.
+2. 설치 완료 후, 변경된 lock 파일과 `node_modules`를 분석하여 의심스러운 패턴을 탐지합니다.
+3. 검증이 모두 통과되면 해당 스냅샷을 `~/.npm-reorg-guard/confirmed`에 자동으로 확정(confirm)합니다.
+4. 의심스러운 변경이 발견되면 마지막으로 confirmed 된 안전 스냅샷으로 롤백(reorg)하고 `node_modules`도 다시 설치합니다.
 
 ## 감지하는 위협
 
-- 비표준 npm 레지스트리로의 resolved URL
+- 비표준 npm 레지스트리 또는 공식 레지스트리 외 `--registry` 지정
 - 패키지 install 스크립트 내 네트워크 접근
 - install 스크립트 내 코드 실행 (eval, exec, child_process)
 - 민감한 경로 접근 시도 (.ssh, .env, .aws, credentials)
@@ -68,6 +69,8 @@ cp -r npm-reorg-guard ~/.claude/skills/
 - `shasum` 또는 `sha256sum` — 해시 계산에 사용
 - `file` — 바이너리 탐지에 사용 (선택)
 
+`jq`가 없으면 훅은 경고만 출력하고 안전하게 종료합니다.
+
 ```bash
 # macOS
 brew install jq
@@ -84,4 +87,6 @@ Reorg(롤백) 이벤트는 `~/.npm-reorg-guard/reorg.log`에 기록됩니다.
 cat ~/.npm-reorg-guard/reorg.log
 ```
 
-스냅샷 파일은 `~/.npm-reorg-guard/snapshots/`에 저장되며, 최근 10개만 유지됩니다.
+현재 confirmed 된 스냅샷 ID는 `~/.npm-reorg-guard/confirmed`에 저장됩니다.
+
+스냅샷 파일은 `~/.npm-reorg-guard/snapshots/`에 저장되며, 최근 10개의 비확정 스냅샷만 정리되고 confirmed 체인은 보존됩니다.
