@@ -1,0 +1,26 @@
+{
+  "name": "npm-reorg-guard",
+  "version": "1.0.0",
+  "description": "Blockchain reorg concept applied to npm package security — Claude Code hooks that snapshot lock files and auto-rollback on suspicious changes",
+  "main": "scripts/guard.sh",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "npm",
+    "security",
+    "supply-chain",
+    "blockchain",
+    "reorg",
+    "claude-code",
+    "hooks",
+    "package-lock",
+    "rollback"
+  ],
+  "author": "soohongkim",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/soohongkim/npm-reorg-guard.git"
+  }
+}
