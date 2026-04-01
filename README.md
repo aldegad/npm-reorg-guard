@@ -90,6 +90,8 @@ After the install command completes, the verify hook analyzes what changed:
 | Pipe execution | `curl \| bash`, `wget \| sh` | Pre-flight | **Block** |
 | Registry hijack | `--registry` pointing to unofficial sources | Pre-flight | **Block** |
 | Script safety bypass | `npm config set ignore-scripts false` | Pre-flight | **Block** |
+| Command indirection | `eval "npm install ..."`, subshell expansion, variable indirection | Pre-flight | **Guard** |
+| npx/dlx execution | `npx`, `pnpm dlx`, `yarn dlx` package execution | Pre-flight | **Guard** |
 | Malicious install scripts | Network calls, `eval`/`exec`, sensitive path access in hooks | Post-install | **Reorg** |
 | Obfuscated code | Base64, hex encoding, `Buffer.from` in install scripts | Post-install | **Reorg** |
 | Lock file tampering | Resolved URLs from non-standard registries | Post-install | **Reorg** |
@@ -195,6 +197,20 @@ ls -la ~/.npm-reorg-guard/snapshots/
 ```
 
 Old unconfirmed snapshots are automatically pruned (keeping the 10 most recent), while the confirmed snapshot chain is always preserved.
+
+## Security Hardening
+
+`npm-reorg-guard` includes multiple layers of defense against attacks targeting the guard itself:
+
+| Measure | What it prevents |
+|---|---|
+| **JSON-safe metadata** | `project_dir` is escaped via `jq -Rs` to prevent JSON injection in snapshot metadata |
+| **Path canonicalization** | `realpath`/`readlink -f` resolves symlinks and `..` traversal in `cwd` before use |
+| **Atomic state files** | Snapshot ID and project directory are written as a single JSON file, preventing TOCTOU races |
+| **Stale lock recovery** | Locks older than 60 seconds are automatically removed, preventing permanent DoS from `SIGKILL`/OOM |
+| **Project-scoped state** | Each project gets its own confirmed snapshot chain (`confirmed_${dir_hash}`), preventing cross-project interference |
+| **Restrictive permissions** | `umask 077` ensures `~/.npm-reorg-guard/` is readable only by the owner |
+| **Indirection detection** | Commands using `eval`, `$()`, or backticks with package manager keywords are treated as install candidates |
 
 ## Project Structure
 

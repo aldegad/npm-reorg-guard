@@ -10,39 +10,52 @@ hooks:
 
 # npm-reorg-guard
 
-블록체인 reorg 개념을 npm 보안에 적용한 Claude Code 스킬입니다.
+Blockchain reorg concept applied to npm supply-chain security for Claude Code.
 
-## 작동 원리
+## How It Works
 
-1. `npm install`, `pnpm add` 등 패키지 설치 명령 감지 시, 현재 lock 파일의 "안전 스냅샷"을 저장하고 `_meta.json`에 `parent_snapshot_id`를 기록합니다.
-2. 설치 완료 후, 변경된 lock 파일과 `node_modules`를 분석하여 의심스러운 패턴을 탐지합니다.
-3. 검증이 모두 통과되면 해당 스냅샷을 `~/.npm-reorg-guard/confirmed`에 자동으로 확정(confirm)합니다.
-4. 의심스러운 변경이 발견되면 마지막으로 confirmed 된 안전 스냅샷으로 롤백(reorg)하고 `node_modules`도 다시 설치합니다.
+1. Detects package install commands (`npm install`, `pnpm add`, `yarn add`, `npx`, etc.) and snapshots lock files into `~/.npm-reorg-guard/snapshots/` with a `parent_snapshot_id` forming a chain.
+2. After install completes, analyzes lock file diffs, install scripts, and `node_modules/.bin/` for suspicious patterns.
+3. If all checks pass, the snapshot is **confirmed** as the new safe baseline (project-scoped via `confirmed_${dir_hash}`).
+4. If anything is suspicious, a **reorg** rolls back to the last confirmed snapshot and reinstalls `node_modules`.
 
-## 감지하는 위협
+## Threat Detection
 
-- 비표준 npm 레지스트리 또는 공식 레지스트리 외 `--registry` 지정
-- 패키지 install 스크립트 내 네트워크 접근
-- install 스크립트 내 코드 실행 (eval, exec, child_process)
-- 민감한 경로 접근 시도 (.ssh, .env, .aws, credentials)
-- 난독화된 코드 (base64, hex encoding)
-- 비정상적으로 많은 새 의존성 추가
-- node_modules 내 네이티브 바이너리
-- 타이포스쿼팅 패턴의 패키지명
-- 비보안(non-HTTPS) resolved URL
+**Pre-flight (blocks before execution):**
+- Non-standard `--registry` URLs
+- Typosquatting package names (`lod_sh`, `reacct`, `axois`, etc.)
+- Piped remote execution (`curl | bash`)
+- Disabling install script safety
+- Command indirection (`eval`, subshell expansion) hiding install commands
+- `npx`, `pnpm dlx`, `yarn dlx` execution
 
-## 설치 방법
+**Post-install (triggers reorg):**
+- Install scripts with network access, code execution, or sensitive path access
+- Obfuscated content (base64, hex encoding)
+- Lock file resolved URLs from non-standard registries or insecure protocols
+- Unusually large dependency additions (>50 new entries)
+- Native binaries in `node_modules/.bin/`
 
-### 1. 스킬 디렉토리에 복사
+## Security Hardening
+
+- JSON-safe metadata (PROJECT_DIR escaped via `jq -Rs`)
+- Path canonicalization (`realpath`/`readlink -f`) prevents traversal attacks
+- Atomic state files prevent TOCTOU race conditions
+- Stale lock recovery (auto-remove locks >60s old)
+- Project-scoped confirmed state prevents cross-project interference
+- Restrictive permissions (`umask 077`)
+
+## Installation
+
+### 1. Copy to skills directory
 
 ```bash
-# 프로젝트 루트 또는 글로벌 스킬 디렉토리에 복사
 cp -r npm-reorg-guard ~/.claude/skills/
 ```
 
-### 2. Claude Code 설정에 훅 추가
+### 2. Add hooks to Claude Code settings
 
-`.claude/settings.json` 파일에 다음을 추가합니다:
+In `.claude/settings.json`:
 
 ```json
 {
@@ -50,26 +63,34 @@ cp -r npm-reorg-guard ~/.claude/skills/
     "PreToolUse": [
       {
         "matcher": "Bash",
-        "hook": "~/.claude/skills/npm-reorg-guard/scripts/guard.sh"
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/skills/npm-reorg-guard/scripts/guard.sh"
+          }
+        ]
       }
     ],
     "PostToolUse": [
       {
         "matcher": "Bash",
-        "hook": "~/.claude/skills/npm-reorg-guard/scripts/verify.sh"
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/skills/npm-reorg-guard/scripts/verify.sh"
+          }
+        ]
       }
     ]
   }
 }
 ```
 
-### 3. 필요 의존성 확인
+### 3. Dependencies
 
-- `jq` — JSON 파싱에 사용
-- `shasum` 또는 `sha256sum` — 해시 계산에 사용
-- `file` — 바이너리 탐지에 사용 (선택)
-
-`jq`가 없으면 훅은 경고만 출력하고 안전하게 종료합니다.
+- `jq` -- JSON parsing (hooks skip gracefully if missing)
+- `shasum` or `sha256sum` -- hash computation
+- `file` (optional) -- binary detection
 
 ```bash
 # macOS
@@ -79,14 +100,14 @@ brew install jq
 sudo apt-get install jq
 ```
 
-## 로그 확인
+## Logs
 
-Reorg(롤백) 이벤트는 `~/.npm-reorg-guard/reorg.log`에 기록됩니다.
+Reorg events are logged to `~/.npm-reorg-guard/reorg.log`.
 
 ```bash
 cat ~/.npm-reorg-guard/reorg.log
 ```
 
-현재 confirmed 된 스냅샷 ID는 `~/.npm-reorg-guard/confirmed`에 저장됩니다.
+Confirmed snapshot IDs are stored per-project in `~/.npm-reorg-guard/confirmed_${dir_hash}`.
 
-스냅샷 파일은 `~/.npm-reorg-guard/snapshots/`에 저장되며, 최근 10개의 비확정 스냅샷만 정리되고 confirmed 체인은 보존됩니다.
+Snapshots are stored in `~/.npm-reorg-guard/snapshots/`. Old unconfirmed snapshots are pruned (keeping the 10 most recent), while the confirmed chain is always preserved.

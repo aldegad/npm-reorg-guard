@@ -8,6 +8,7 @@ GUARD_DIR="${HOME}/.npm-reorg-guard"
 SNAPSHOT_DIR="${GUARD_DIR}/snapshots"
 STATE_LOCK_DIR="${GUARD_DIR}/state.lock"
 
+umask 077
 mkdir -p "${GUARD_DIR}" "${SNAPSHOT_DIR}"
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -19,6 +20,21 @@ acquire_state_lock() {
   local attempts=0
 
   while ! mkdir "${STATE_LOCK_DIR}" 2>/dev/null; do
+    # Detect stale locks left by SIGKILL/OOM (V-005)
+    if [[ -d "${STATE_LOCK_DIR}" ]]; then
+      local lock_mtime=""
+      if lock_mtime=$(stat -f %m "${STATE_LOCK_DIR}" 2>/dev/null) || \
+         lock_mtime=$(stat -c %Y "${STATE_LOCK_DIR}" 2>/dev/null); then
+        local now
+        now=$(date +%s)
+        if [[ $(( now - lock_mtime )) -gt 60 ]]; then
+          echo "npm-reorg-guard: removing stale lock ($(( now - lock_mtime ))s old)." >&2
+          rmdir "${STATE_LOCK_DIR}" 2>/dev/null || true
+          continue
+        fi
+      fi
+    fi
+
     attempts=$((attempts + 1))
     if [[ ${attempts} -ge 100 ]]; then
       echo "npm-reorg-guard: could not acquire state lock; skipping verify hook." >&2
@@ -39,6 +55,18 @@ write_state_file() {
 
   printf '%s\n' "${value}" > "${temp_path}"
   mv "${temp_path}" "${target_path}"
+}
+
+compute_dir_hash() {
+  local input_dir="$1"
+
+  if command -v md5sum >/dev/null 2>&1; then
+    printf '%s' "${input_dir}" | md5sum | cut -d' ' -f1
+  elif command -v md5 >/dev/null 2>&1; then
+    md5 -q -s "${input_dir}"
+  else
+    printf '%s' "${input_dir}" | cksum | cut -d' ' -f1
+  fi
 }
 
 hash_file() {
@@ -85,9 +113,14 @@ files_differ() {
 
 read_confirmed_snapshot() {
   local confirmed_snapshot=""
+  local dir_hash="${1:-}"
 
   acquire_state_lock
-  if [[ -f "${GUARD_DIR}/confirmed" ]]; then
+  # Project-scoped confirmed file
+  if [[ -n "${dir_hash}" ]] && [[ -f "${GUARD_DIR}/confirmed_${dir_hash}" ]]; then
+    confirmed_snapshot=$(cat "${GUARD_DIR}/confirmed_${dir_hash}" 2>/dev/null || true)
+  elif [[ -f "${GUARD_DIR}/confirmed" ]]; then
+    # Legacy fallback
     confirmed_snapshot=$(cat "${GUARD_DIR}/confirmed" 2>/dev/null || true)
   fi
   release_state_lock; STATE_LOCK_HELD=false
@@ -97,19 +130,25 @@ read_confirmed_snapshot() {
 
 confirm_snapshot() {
   local snapshot_id="$1"
+  local dir_hash="${2:-}"
 
   acquire_state_lock; STATE_LOCK_HELD=true
-  write_state_file "${GUARD_DIR}/confirmed" "${snapshot_id}"
+  if [[ -n "${dir_hash}" ]]; then
+    write_state_file "${GUARD_DIR}/confirmed_${dir_hash}" "${snapshot_id}"
+  else
+    write_state_file "${GUARD_DIR}/confirmed" "${snapshot_id}"
+  fi
   release_state_lock; STATE_LOCK_HELD=false
 }
 
 collect_protected_snapshot_ids() {
+  local dir_hash="${1:-}"
   local snapshot_id
   local parent_snapshot_id
   local meta_file
   local seen=()
 
-  snapshot_id=$(read_confirmed_snapshot)
+  snapshot_id=$(read_confirmed_snapshot "${dir_hash}")
 
   while [[ -n "${snapshot_id}" ]]; do
     local already_seen="false"
@@ -164,7 +203,7 @@ cleanup_old_snapshots() {
     if [[ -n "${protected_snapshot_id}" ]]; then
       protected_snapshot_ids+=("${protected_snapshot_id}")
     fi
-  done < <(collect_protected_snapshot_ids)
+  done < <(collect_protected_snapshot_ids "${DIR_HASH:-}")
 
   while IFS= read -r old_meta; do
     old_id=$(jq -r '.snapshot_id // empty' "${old_meta}" 2>/dev/null || true)
@@ -219,17 +258,32 @@ STATE_LOCK_HELD=true
 acquire_state_lock
 trap '[ "${STATE_LOCK_HELD:-}" = "true" ] && release_state_lock; STATE_LOCK_HELD=false' EXIT
 
-# Check if we have a pending snapshot to verify
-if [[ ! -f "${GUARD_DIR}/current_snapshot_id" ]]; then
-  exit 0
+# Check if we have a pending snapshot to verify (V-004: atomic state file)
+if [[ ! -f "${GUARD_DIR}/current_state" ]]; then
+  # Legacy fallback for in-flight upgrades
+  if [[ ! -f "${GUARD_DIR}/current_snapshot_id" ]]; then
+    exit 0
+  fi
+  SNAPSHOT_ID=$(cat "${GUARD_DIR}/current_snapshot_id")
+  PROJECT_DIR=$(cat "${GUARD_DIR}/current_project_dir" 2>/dev/null || pwd)
+  rm -f "${GUARD_DIR}/current_snapshot_id" "${GUARD_DIR}/current_project_dir"
+else
+  CURRENT_STATE=$(cat "${GUARD_DIR}/current_state")
+  SNAPSHOT_ID=$(echo "${CURRENT_STATE}" | jq -r '.snapshot_id // empty')
+  PROJECT_DIR=$(echo "${CURRENT_STATE}" | jq -r '.project_dir // empty')
+  DIR_HASH=$(echo "${CURRENT_STATE}" | jq -r '.dir_hash // empty')
+  rm -f "${GUARD_DIR}/current_state"
 fi
 
-SNAPSHOT_ID=$(cat "${GUARD_DIR}/current_snapshot_id")
-PROJECT_DIR=$(cat "${GUARD_DIR}/current_project_dir" 2>/dev/null || pwd)
-
-# Clean up current marker
-rm -f "${GUARD_DIR}/current_snapshot_id"
-rm -f "${GUARD_DIR}/current_project_dir"
+if [[ -z "${SNAPSHOT_ID}" ]]; then
+  exit 0
+fi
+if [[ -z "${PROJECT_DIR}" ]]; then
+  PROJECT_DIR=$(pwd)
+fi
+if [[ -z "${DIR_HASH:-}" ]]; then
+  DIR_HASH=$(compute_dir_hash "${PROJECT_DIR}")
+fi
 release_state_lock; STATE_LOCK_HELD=false
 
 # Verify snapshot exists
@@ -276,7 +330,8 @@ check_postinstall_scripts() {
       script_packages=$(find "${PROJECT_DIR}/node_modules" -maxdepth 3 -name "package.json" 2>/dev/null | head -50)
     fi
 
-    for pkg in ${script_packages}; do
+    while IFS= read -r pkg; do
+      [[ -z "${pkg}" ]] && continue
       # Check for suspicious install hooks
       local has_preinstall
       local has_postinstall
@@ -317,7 +372,7 @@ check_postinstall_scripts() {
           REASONS+=("Package '${pkg_name}' has install script with obfuscated content")
         fi
       done
-    done
+    done <<< "${script_packages}"
   fi
 }
 
@@ -382,12 +437,11 @@ check_binaries() {
     fi
 
     for bin in ${new_bins}; do
-      # Check if it's a binary file (not a script)
-      if file "${bin}" 2>/dev/null | grep -qiE '(executable|shared object|Mach-O|ELF)'; then
-        local bin_name
-        bin_name=$(basename "${bin}")
+      # Check if it's a binary file (not a script) — use full path (V-010)
+      local bin_path="${PROJECT_DIR}/node_modules/.bin/${bin}"
+      if [[ -f "${bin_path}" ]] && file "${bin_path}" 2>/dev/null | grep -qiE '(executable|shared object|Mach-O|ELF)'; then
         SUSPICIOUS=true
-        REASONS+=("Native binary '${bin_name}' found in node_modules/.bin")
+        REASONS+=("Native binary '${bin}' found in node_modules/.bin")
       fi
     done
   fi
@@ -402,7 +456,7 @@ check_binaries
 
 if [[ "${SUSPICIOUS}" == "true" ]]; then
   # REORG: Rollback to last confirmed safe snapshot
-  ROLLBACK_SNAPSHOT_ID=$(read_confirmed_snapshot)
+  ROLLBACK_SNAPSHOT_ID=$(read_confirmed_snapshot "${DIR_HASH}")
   if [[ -z "${ROLLBACK_SNAPSHOT_ID}" ]] || [[ ! -f "${SNAPSHOT_DIR}/${ROLLBACK_SNAPSHOT_ID}_meta.json" ]]; then
     ROLLBACK_SNAPSHOT_ID="${SNAPSHOT_ID}"
   fi
@@ -459,7 +513,7 @@ EOF
   exit 0
 fi
 
-confirm_snapshot "${SNAPSHOT_ID}"
+confirm_snapshot "${SNAPSHOT_ID}" "${DIR_HASH}"
 cleanup_old_snapshots
 
 exit 0

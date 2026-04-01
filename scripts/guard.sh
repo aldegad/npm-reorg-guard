@@ -9,6 +9,7 @@ GUARD_DIR="${HOME}/.npm-reorg-guard"
 SNAPSHOT_DIR="${GUARD_DIR}/snapshots"
 STATE_LOCK_DIR="${GUARD_DIR}/state.lock"
 
+umask 077
 mkdir -p "${GUARD_DIR}" "${SNAPSHOT_DIR}"
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -20,6 +21,21 @@ acquire_state_lock() {
   local attempts=0
 
   while ! mkdir "${STATE_LOCK_DIR}" 2>/dev/null; do
+    # Detect stale locks left by SIGKILL/OOM (V-005)
+    if [[ -d "${STATE_LOCK_DIR}" ]]; then
+      local lock_mtime=""
+      if lock_mtime=$(stat -f %m "${STATE_LOCK_DIR}" 2>/dev/null) || \
+         lock_mtime=$(stat -c %Y "${STATE_LOCK_DIR}" 2>/dev/null); then
+        local now
+        now=$(date +%s)
+        if [[ $(( now - lock_mtime )) -gt 60 ]]; then
+          echo "npm-reorg-guard: removing stale lock ($(( now - lock_mtime ))s old)." >&2
+          rmdir "${STATE_LOCK_DIR}" 2>/dev/null || true
+          continue
+        fi
+      fi
+    fi
+
     attempts=$((attempts + 1))
     if [[ ${attempts} -ge 100 ]]; then
       echo "npm-reorg-guard: could not acquire state lock; skipping guard hook." >&2
@@ -50,7 +66,7 @@ compute_dir_hash() {
   elif command -v md5 >/dev/null 2>&1; then
     md5 -q -s "${input_dir}"
   else
-    echo "unknown"
+    printf '%s' "${input_dir}" | cksum | cut -d' ' -f1
   fi
 }
 
@@ -67,10 +83,16 @@ if [[ "${TOOL_NAME}" != "Bash" ]] || [[ -z "${COMMAND}" ]]; then
 fi
 
 # Detect package install/update commands
-INSTALL_PATTERN='(npm[[:space:]]+(install|i|add|update|up|upgrade)|pnpm[[:space:]]+(add|install|update|up)|yarn[[:space:]]+(add|install|upgrade))'
+INSTALL_PATTERN='(npm[[:space:]]+(install|i|add|update|up|upgrade)|npx[[:space:]]|pnpm[[:space:]]+(add|install|update|up|dlx)|yarn[[:space:]]+(add|install|upgrade|dlx))'
 
 if ! echo "${COMMAND}" | grep -qEi "${INSTALL_PATTERN}"; then
-  exit 0
+  # Catch indirection patterns that hide install commands (V-002)
+  if echo "${COMMAND}" | grep -qEi '(eval[[:space:]]|\$\(|`)' && \
+     echo "${COMMAND}" | grep -qEi '(npm|pnpm|yarn).*(install|add)'; then
+    : # Fall through — treat as install candidate
+  else
+    exit 0
+  fi
 fi
 
 # --- Reorg Guard Activated ---
@@ -81,6 +103,13 @@ if [[ -z "${PROJECT_DIR}" ]]; then
   PROJECT_DIR=$(pwd)
 fi
 
+# Canonicalize to prevent path traversal (V-003)
+if command -v realpath >/dev/null 2>&1; then
+  PROJECT_DIR=$(realpath "${PROJECT_DIR}" 2>/dev/null || echo "${PROJECT_DIR}")
+elif command -v readlink >/dev/null 2>&1; then
+  PROJECT_DIR=$(readlink -f "${PROJECT_DIR}" 2>/dev/null || echo "${PROJECT_DIR}")
+fi
+
 TIMESTAMP=$(date +%s)
 DIR_HASH=$(compute_dir_hash "${PROJECT_DIR}")
 SNAPSHOT_ID="${TIMESTAMP}_${DIR_HASH}"
@@ -89,12 +118,21 @@ acquire_state_lock
 trap 'release_state_lock' EXIT
 
 PARENT_SNAPSHOT_ID=""
-if [[ -f "${GUARD_DIR}/confirmed" ]]; then
-  PARENT_SNAPSHOT_ID=$(cat "${GUARD_DIR}/confirmed" 2>/dev/null || true)
+CONFIRMED_FILE="${GUARD_DIR}/confirmed_${DIR_HASH}"
+if [[ -f "${CONFIRMED_FILE}" ]]; then
+  PARENT_SNAPSHOT_ID=$(cat "${CONFIRMED_FILE}" 2>/dev/null || true)
 fi
 
 if [[ -n "${PARENT_SNAPSHOT_ID}" ]] && [[ ! -f "${SNAPSHOT_DIR}/${PARENT_SNAPSHOT_ID}_meta.json" ]]; then
-  PARENT_SNAPSHOT_ID=""
+  # Fallback: check legacy global confirmed file for migration
+  if [[ -f "${GUARD_DIR}/confirmed" ]]; then
+    PARENT_SNAPSHOT_ID=$(cat "${GUARD_DIR}/confirmed" 2>/dev/null || true)
+    if [[ -n "${PARENT_SNAPSHOT_ID}" ]] && [[ ! -f "${SNAPSHOT_DIR}/${PARENT_SNAPSHOT_ID}_meta.json" ]]; then
+      PARENT_SNAPSHOT_ID=""
+    fi
+  else
+    PARENT_SNAPSHOT_ID=""
+  fi
 fi
 
 PARENT_SNAPSHOT_JSON=$(printf '%s' "${PARENT_SNAPSHOT_ID}" | jq -Rs 'if length == 0 then null else . end')
@@ -137,8 +175,8 @@ cat > "${SNAPSHOT_DIR}/${SNAPSHOT_ID}_meta.json" << META_EOF
   "snapshot_id": "${SNAPSHOT_ID}",
   "parent_snapshot_id": ${PARENT_SNAPSHOT_JSON},
   "timestamp": ${TIMESTAMP},
-  "project_dir": "${PROJECT_DIR}",
-  "command": $(echo "${COMMAND}" | jq -Rs .),
+  "project_dir": $(printf '%s' "${PROJECT_DIR}" | jq -Rs .),
+  "command": $(printf '%s' "${COMMAND}" | jq -Rs .),
   "lock_files_found": ${SNAPSHOTTED}
 }
 META_EOF
@@ -183,9 +221,10 @@ EOF
   exit 0
 fi
 
-# Write current snapshot ID for PostToolUse to pick up only when the command is allowed
-write_state_file "${GUARD_DIR}/current_snapshot_id" "${SNAPSHOT_ID}"
-write_state_file "${GUARD_DIR}/current_project_dir" "${PROJECT_DIR}"
+# Write current state atomically for PostToolUse (V-004: single file prevents TOCTOU)
+CURRENT_STATE=$(jq -n --arg sid "${SNAPSHOT_ID}" --arg pdir "${PROJECT_DIR}" --arg dhash "${DIR_HASH}" \
+  '{snapshot_id: $sid, project_dir: $pdir, dir_hash: $dhash}')
+write_state_file "${GUARD_DIR}/current_state" "${CURRENT_STATE}"
 
 # Allow the command to proceed — PostToolUse will verify the result
 exit 0
