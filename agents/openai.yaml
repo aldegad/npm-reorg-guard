@@ -1,0 +1,4 @@
+interface:
+  display_name: "NPM Reorg Guard"
+  short_description: "Opt-in npm install supply-chain guard hooks."
+  default_prompt: "Install or review the npm reorg guard hooks for package install safety."
