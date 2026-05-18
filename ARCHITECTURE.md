@@ -1,305 +1,593 @@
-# Architecture
+# Safedeps Architecture (v2)
 
-`npm-reorg-guard` 의 내부 동작·설계 다이어그램. 사용자 설치 가이드는 `README.md`, 스킬 메타·hook 선언은 `SKILL.md` 가 SSoT.
+> **Note on naming**: 이 repo 는 v1 시절 `npm-reorg-guard` 로 출시됐다. v2 부터 ecosystem 통합 + advisory-first 게이트를 도입하면서 제품/CLI 이름을 **`safedeps`** 로 rename 한다. 내부 post-install rollback engine 은 v1 의 `reorg-guard` 컨셉을 그대로 계승. 이 문서는 v2 의 SSoT.
 
----
-
-## 1. The Big Picture — Blockchain Reorg 비유
-
-```
-            BLOCKCHAIN                      NPM LOCKFILE CHAIN
-            ──────────                      ──────────────────
-
-   ┌────────┐  ┌────────┐  ┌────────┐      ┌────────┐  ┌────────┐  ┌────────┐
-   │ block0 │←─│ block1 │←─│ block2 │      │ snap-0 │←─│ snap-1 │←─│ snap-2 │
-   │  hash  │  │ parent │  │ parent │      │  lock  │  │ parent │  │ parent │
-   └────────┘  └────────┘  └────────┘      └────────┘  └────────┘  └────────┘
-       │           │           │                │           │           │
-    confirmed   confirmed     PoW              confirmed   confirmed   verify?
-                                                                          │
-                                                                  ┌───────┴───────┐
-                                                                  ▼               ▼
-                                                              suspicious        clean
-                                                              → REORG          → CONFIRM
-                                                              rollback to      become new
-                                                              snap-1           baseline
-```
-
-핵심 아이디어:
-- 각 `npm install` / `pnpm add` / `yarn add` / `npx` 가 **블록** 1개에 해당.
-- 각 블록은 lockfile snapshot + `parent_snapshot_id` 로 직전 confirmed snapshot 을 가리킴 → **chain**.
-- 새 블록이 "의심" 으로 판정되면 → **reorg** = 마지막 confirmed snapshot 으로 lockfile · `node_modules` 롤백.
-- 깨끗하면 → 그 블록이 새 **confirmed baseline** 이 되어 다음 install 의 parent 가 됨.
+기능 분리:
+- **README.md** — 사용자 설치/사용 가이드 (rename 후 갱신 예정)
+- **SKILL.md** — 스킬 메타 + hook 선언 (Claude/Codex skill loader 가 읽는 SSoT)
+- **ARCHITECTURE.md** — 내부 흐름·설계 (이 문서)
 
 ---
 
-## 2. Runtime Flow — Bash 한 줄이 들어왔을 때
+## 0. 핵심 한 문장 (코덱시 합의)
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  Claude / Codex 가 Bash 명령 실행을 요청                                       │
-│  (예: npm install @jackwener/opencli)                                          │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-                        ╔═══════════════════════╗
-                        ║   PreToolUse  HOOK    ║
-                        ║   ────────────────    ║
-                        ║   scripts/guard.sh    ║
-                        ╚═══════════════════════╝
-                                    │
-                ┌───────────────────┼───────────────────┐
-                ▼                   ▼                   ▼
-       ┌─────────────────┐ ┌───────────────┐ ┌─────────────────┐
-       │  명령 분류기      │ │  pre-flight   │ │ lockfile        │
-       │ npm/pnpm/yarn/   │ │ 차단 패턴      │ │ snapshot        │
-       │ npx/dlx/eval...  │ │ ─────────     │ │ ─────────       │
-       └─────────────────┘ │ • typosquat   │ │ ~/.npm-reorg-   │
-                           │ • curl|bash   │ │ guard/snapshots/│
-                           │ • --registry  │ │ + parent_snap_id│
-                           │ • install:    │ │   (체인 연결)    │
-                           │   safety off  │ │                 │
-                           │ • npx remote  │ └─────────────────┘
-                           │ • eval/subsh  │
-                           └───────┬───────┘
-                                   │
-                          ┌────────┴────────┐
-                          ▼                 ▼
-                      매치 0 = pass      매치 = BLOCK
-                          │                 │
-                          ▼                 ▼
-              ┌──────────────────┐  ┌──────────────────┐
-              │ Bash 명령 실제 실행 │  │ exit 2 + reason   │
-              │ (npm install...)  │  │ Claude 한테 차단   │
-              └──────────────────┘  │ 메시지 반환         │
-                          │         └──────────────────┘
-                          ▼
-                ╔═══════════════════════╗
-                ║  PostToolUse  HOOK    ║
-                ║  ────────────────     ║
-                ║  scripts/verify.sh    ║
-                ╚═══════════════════════╝
-                          │
-          ┌───────────────┼───────────────────────────────┐
-          ▼               ▼                               ▼
-   ┌──────────────┐ ┌───────────────────┐ ┌─────────────────────┐
-   │ lockfile diff │ │ install scripts   │ │ node_modules/.bin/   │
-   │ ─────────    │ │ 검사               │ │ 검사                  │
-   │ • resolved   │ │ ─────────         │ │ ─────────            │
-   │   URL 도메인  │ │ • 네트워크 호출    │ │ • 새 native binary    │
-   │ • insecure   │ │ • 코드 실행        │ │ • 의심 패턴            │
-   │   protocol   │ │ • sensitive path  │ │                      │
-   │ • 비표준     │ │ • base64/hex      │ │                      │
-   │   registry   │ │   난독화           │ │                      │
-   │ • 50+ 새     │ │                   │ │                      │
-   │   의존성 추가 │ │                   │ │                      │
-   └──────┬───────┘ └─────────┬─────────┘ └──────────┬──────────┘
-          │                   │                       │
-          └───────────────────┼───────────────────────┘
-                              ▼
-                     ┌────────┴────────┐
-                     ▼                 ▼
-                 모두 깨끗            한 가지라도 의심
-                     │                 │
-                     ▼                 ▼
-          ┌──────────────────┐  ┌─────────────────────────────┐
-          │ CONFIRM          │  │ REORG (rollback)             │
-          │ ─────────       │  │ ─────────                    │
-          │ snapshot 을      │  │ • lockfile ← 마지막           │
-          │ confirmed_${dir} │  │   confirmed snapshot 으로 복원 │
-          │ 에 기록          │  │ • rm -rf node_modules         │
-          │ (프로젝트별)      │  │ • npm install (재설치)        │
-          │                  │  │ • reorg.log 에 기록           │
-          │ 다음 install 의   │  │ • Claude 한테 경고             │
-          │ parent 가 됨     │  └─────────────────────────────┘
-          └──────────────────┘
-```
+> *Safedeps does not decide at install time from multiple live truths.*
+> *It approves one dependency spec from provider evidence first, then the hook only enforces that approved spec; reorg remains the rollback layer if the install result diverges.*
 
-핵심:
-- **PreToolUse = 사전 차단** (typosquat / curl|bash / 비표준 registry — *명령이 실행되기 전에* 막음).
-- **PostToolUse = 사후 검증 + 자동 reorg** (install script · lockfile diff · node_modules 검사 → 의심 시 rollback).
-- 둘은 같은 `~/.npm-reorg-guard/` snapshot 저장소를 공유. PreToolUse 가 snapshot 만들고 PostToolUse 가 confirm/rollback.
+번역: Safedeps 는 install 순간에 여러 라이브 truth 를 동시에 조회해서 결정하지 않는다. **사전에 provider evidence 로 안전한 dependency spec 을 먼저 승인** (approve) 하고, **hook 은 그 승인된 spec 과 명령이 일치할 때만 통과**시킨다. **reorg 는 install 결과가 spec 과 어긋날 때의 rollback layer** 로 남는다.
 
 ---
 
-## 3. State Layout — `~/.npm-reorg-guard/`
+## 1. The Big Picture — 3-Phase Defense
 
 ```
-~/.npm-reorg-guard/
-├── snapshots/
-│   ├── 20260101-120000-abc123/
-│   │   ├── package-lock.json     ← 실제 lockfile 복사본
-│   │   ├── yarn.lock              ← (있으면)
-│   │   ├── pnpm-lock.yaml         ← (있으면)
-│   │   └── meta.json              ← parent_snapshot_id, dir_hash, command
-│   ├── 20260101-130000-def456/   ← 다음 install
-│   └── ...                        ← 오래된 unconfirmed 은 최근 10개만
-│
-├── confirmed_${dir_hash_A}        ← 프로젝트 A 의 마지막 confirmed snapshot ID
-├── confirmed_${dir_hash_B}        ← 프로젝트 B 의 마지막 confirmed snapshot ID
-├── confirmed_${dir_hash_C}        ← ...
-│
-├── locks/                         ← TOCTOU race 방지 (atomic state)
-│   └── *.lock                     ← stale > 60s 자동 제거
-│
-└── reorg.log                      ← 모든 reorg event 기록 (append-only)
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │                                                                     │
+   │   Phase 1: ADVISORY GATE          Phase 2: HOOK ENFORCEMENT          │
+   │   ────────────────────            ────────────────────               │
+   │                                                                     │
+   │   사용자 의도                       │                                 │
+   │   (intent: 이 패키지 설치           │                                 │
+   │    하고 싶다)                       │                                 │
+   │      │                            │                                 │
+   │      ▼                            │                                 │
+   │   ┌─────────────┐    OSV.dev      │                                 │
+   │   │ safedeps    │◄────primary─────┤                                 │
+   │   │   check     │    CISA KEV     │                                 │
+   │   │             │◄──hard-risk────┤                                 │
+   │   │             │    GHSA         │                                 │
+   │   │             │◄──enrichment───┤                                 │
+   │   └──────┬──────┘                 │                                 │
+   │          │                                                          │
+   │          ▼                                                          │
+   │   ┌──────────────────────┐                                          │
+   │   │ approved spec ledger │                                          │
+   │   │ .safedeps/           │                                          │
+   │   │   approved-specs/    │                                          │
+   │   │   <hash>.json        │                                          │
+   │   │ • ecosystem          │                                          │
+   │   │ • package@version    │                                          │
+   │   │ • approved_at        │                                          │
+   │   │ • expires_at         │                                          │
+   │   │ • evidence sources   │                                          │
+   │   └──────┬───────────────┘                                          │
+   │          │                                                          │
+   │          ▼                                                          │
+   │                              ┌─────────────────┐                    │
+   │                              │ 사용자 / Claude  │                    │
+   │                              │ install 명령 발행 │                    │
+   │                              │ (npm install ..) │                    │
+   │                              └────────┬────────┘                    │
+   │                                       │                             │
+   │                                       ▼                             │
+   │                              ╔═════════════════╗                    │
+   │                              ║ PreToolUse HOOK ║                    │
+   │                              ║   guard.sh      ║                    │
+   │                              ╚════════╤════════╝                    │
+   │                                       │                             │
+   │                              ledger 조회:                            │
+   │                              "이 명령의 ecosystem +                  │
+   │                               pkg@version 이 approved              │
+   │                               spec 과 일치?"                         │
+   │                                       │                             │
+   │                              ┌────────┴────────┐                    │
+   │                              ▼                 ▼                    │
+   │                          match O          match X                   │
+   │                              │                 │                    │
+   │                              ▼                 ▼                    │
+   │                       명령 실행          BLOCK + 안내                  │
+   │                          │              ("safedeps                   │
+   │                          │               check ... 먼저 해")          │
+   │                          ▼                                          │
+   │                  install 실행                                       │
+   │                          │                                          │
+   │                          ▼                                          │
+   │                  ╔════════════════╗                                 │
+   │                  ║ PostToolUse    ║                                 │
+   │                  ║ HOOK verify.sh ║                                 │
+   │                  ╚════════╤═══════╝                                 │
+   │                           │                                         │
+   │                  lockfile diff vs                                   │
+   │                  approved spec 비교                                  │
+   │                           │                                         │
+   │                  ┌────────┴────────┐                                │
+   │                  ▼                 ▼                                │
+   │              spec 과 동일       diverged                             │
+   │                  │                 │                                │
+   │                  ▼                 ▼                                │
+   │              CONFIRM            REORG                               │
+   │              (clean baseline)   (rollback to                        │
+   │                                  last confirmed)                    │
+   │                                                                     │
+   │   Phase 3: POST-INSTALL SAFETY NET (v1 의 reorg engine 계승)         │
+   │   ───────────────────────────────────────────────                   │
+   │                                                                     │
+   └─────────────────────────────────────────────────────────────────────┘
 ```
 
-설계 결정 (Security Hardening):
-- **Per-project confirmed state** — `confirmed_${dir_hash}` 로 프로젝트별 분리. 다른 프로젝트의 confirmed 가 침범 못 함.
-- **Atomic state files** — 동시 install 시 race condition (TOCTOU) 방지.
-- **Stale lock 자동 복구** — 60초 넘은 lock 은 dead 로 판단해 제거. 죽은 프로세스가 lock 남기는 케이스 방어.
-- **`umask 077`** — snapshot 파일은 owner 만 읽기.
-- **Path canonicalization** — `realpath` / `readlink -f` 로 traversal 공격 방지.
-- **JSON-safe metadata** — `jq -Rs` 로 escape. dir 경로에 특수문자 있어도 안전.
+핵심 통찰:
+- **Phase 1 = pre-install advisory gate** (새로 추가). vuln DB 조회 → 안전 spec 결정. 사용자/Claude 가 install 명령 *작성하기 전에* 끝남.
+- **Phase 2 = hook enforcement**. hook 자체는 vuln DB 조회 안 함. **approved spec ledger 와의 일치만 검증**. 빠르고 결정론적.
+- **Phase 3 = post-install rollback**. v1 reorg engine 그대로. install 결과가 approved spec 과 어긋나면 마지막 confirmed 로 복원.
 
 ---
 
-## 4. Threat Model — 무엇을 막는가
+## 2. Vulnerability DB — Source Hierarchy
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Pre-flight (PreToolUse / guard.sh) — 명령 실행 BEFORE 차단        │
-├──────────────────────────────────────────────────────────────────┤
-│ • typosquat        lod_sh, reacct, axois, etc.                    │
-│ • curl | bash      pipe remote execution                          │
-│ • --registry       non-standard URLs                              │
-│ • install scripts  safety disabled                                │
-│ • eval / subshell  명령 indirection 으로 install 숨김              │
-│ • npx / dlx        remote 실행 = trust boundary 넘김               │
-└──────────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────────┐
-│  Post-install (PostToolUse / verify.sh) — REORG 트리거             │
-├──────────────────────────────────────────────────────────────────┤
-│ • install script   네트워크 호출 / 코드 실행 / sensitive path 접근  │
-│ • obfuscation      base64 / hex 인코딩된 페이로드                   │
-│ • lockfile         resolved URL 이 비표준 registry / insecure proto │
-│ • dep explosion    한 번에 50+ 새 의존성 추가 (의심)                │
-│ • native binary    node_modules/.bin/ 의 새 native binary           │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  TIER 1 — PRIMARY (canonical truth)                                   │
+│  ────────────────────────────────────────                             │
+│  OSV.dev                                                              │
+│    • multi-ecosystem (npm, pip, cargo, go, gem, maven, nuget, ...)    │
+│    • package@version 질의 표준화                                       │
+│    • Google 운영, 무료 API, JSON                                       │
+│    • GHSA, RustSec, GoVulnDB 등 다 aggregate                          │
+│    → 모든 advisory 의 1차 query target                                 │
+├──────────────────────────────────────────────────────────────────────┤
+│  TIER 2 — OVERLAY (hard-risk signal)                                  │
+│  ────────────────────────────────────────                             │
+│  CISA KEV (Known Exploited Vulnerabilities)                          │
+│    • "실제 야생에서 exploit 확인" 만 추림                                │
+│    • OSV 결과와 cross-reference: KEV 매치 시 hard-block (override 불가) │
+│    → 일반 CVE vs "급박한 CVE" 의 구분선                                 │
+├──────────────────────────────────────────────────────────────────────┤
+│  TIER 3 — ENRICHMENT / CROSS-CHECK                                    │
+│  ────────────────────────────────────────                             │
+│  GitHub Advisory (GHSA)                                              │
+│    • OSV 에 일부 들어오지만 first_patched_version /                    │
+│      vulnerable_version_range 같은 metadata 가 개발자 친화             │
+│    • "OSV 와 다른 결" 만 surface — discrepancy verifier 결              │
+│  NVD                                                                  │
+│    • CVE 원본, CVSS 점수, CPE 매핑, hasKev flag                        │
+│    • 점수 기반 우선순위 계산                                            │
+│  deps.dev (Google)                                                    │
+│    • OSV 기반 + package graph metadata (depended_by, license, ...)    │
+│    • transitive dep 위험 분석                                          │
+│  Snyk DB (optional)                                                   │
+│    • purl 기반 query, UI 풍부                                          │
+│    • 무료 quota 한도, configured optional feed 만 사용                  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-**막지 않는 것** (현재):
-- 이미 confirmed 된 패키지 안의 zero-day 취약점.
-- npm registry 자체의 손상.
-- 사용자가 `KUMA_SKIP_*` / `--ignore-scripts` 같은 명시 우회 한 경우.
+설계 원칙: **canonical truth 는 OSV 하나**. 다른 source 는 enrichment 또는 overlay. 여러 라이브 source 를 \"동급 진실\" 로 두면 cross-fire 발생 — 우리는 OSV 를 truth 로 두고 KEV/GHSA/NVD/deps.dev 는 \"OSV 와 다르거나, OSV 가 못 본 신호\" 만 surface.
 
 ---
 
-## 5. 컴포넌트 책임 분리 (SoC)
+## 3. Approved Spec Ledger — SSoT
+
+`~/.safedeps/approved-specs/<hash>.json`:
+
+```json
+{
+  "hash": "sha256:abc123...",
+  "ecosystem": "npm",
+  "package": "@jackwener/opencli",
+  "version": "1.7.16",
+  "version_range": "^1.7.16",
+  "approved_at": "2026-05-18T13:00:00Z",
+  "expires_at": "2026-06-18T13:00:00Z",
+  "approved_by": "user@example.com",
+  "evidence": {
+    "osv": { "queried_at": "2026-05-18T13:00:00Z", "vulnerabilities": [] },
+    "kev": { "queried_at": "2026-05-18T13:00:00Z", "exploited": false },
+    "ghsa": { "queried_at": "2026-05-18T13:00:00Z", "advisories": [] }
+  },
+  "transitive_specs": [
+    { "package": "...", "version": "...", "spec_hash": "..." }
+  ]
+}
+```
+
+**핵심 필드**:
+- `hash` — `(ecosystem, package, version)` 의 deterministic hash. hook 이 명령에서 같은 hash 추출 → ledger 조회.
+- `approved_at` / `expires_at` — **lifecycle TTL**. 기본 30일. 만료 후 새 CVE 가능성 있어 자동 revoke + re-check 강제.
+- `evidence` — 그 시점에 어느 source 가 무엇을 봤는지. audit trail.
+- `transitive_specs` — direct 만 아니라 transitive dep 도 ledger 에 박아 \"sub-dep 의 zero-day\" 도 감지 가능.
+
+**Lifecycle**:
+
+```
+   approve            install            confirm            re-check
+   ───────            ───────            ───────            ────────
+      │                  │                  │                  │
+      ▼                  ▼                  ▼                  ▼
+   ledger 신규       hook 통과         ledger.confirmed=true   daily cron
+   approved_at=now   spec hash 일치     post-verify 일치        OSV re-query
+   expires_at=+30d                                              │
+                                                                ▼
+                                                        ┌──────┴──────┐
+                                                        ▼             ▼
+                                                  여전히 clean    새 CVE 발견
+                                                        │             │
+                                                        ▼             ▼
+                                                  expires_at      ledger revoke
+                                                  연장             + 사용자 경고
+                                                                  + (옵션) auto reorg
+```
+
+---
+
+## 4. Runtime Flow — 3-Phase Detail
+
+### Phase 1 — `safedeps check <ecosystem> <pkg>@<range>`
+
+```
+사용자 / Claude:
+  "@jackwener/opencli ^1.7.0 깔고 싶음"
+        │
+        ▼
+┌─────────────────────────────────────────────────────────┐
+│ safedeps check npm "@jackwener/opencli@^1.7.0"           │
+└────────────────────┬────────────────────────────────────┘
+                     │
+        ┌────────────┴────────────────────────────┐
+        ▼                                         ▼
+   ┌──────────────┐                       ┌──────────────┐
+   │ resolve      │                       │ ledger lookup │
+   │ version      │                       │ "이미 approved?" │
+   │ range →      │                       └───────┬──────┘
+   │ candidate    │                               │
+   │ versions     │                               ▼
+   └──────┬───────┘                       ┌───────┴─────┐
+          │                               ▼             ▼
+          ▼                          hit (valid)    miss / expired
+   ┌──────────────┐                      │              │
+   │ OSV query    │                      ▼              ▼
+   │ per version  │              "이미 안전, install   "새로 check"
+   └──────┬───────┘               해도 됨"
+          │
+          ▼
+   ┌──────────────┐
+   │ KEV overlay  │
+   │ GHSA cross   │
+   └──────┬───────┘
+          │
+          ▼
+   ┌─────────────────────────────────┐
+   │ 결과 분류:                        │
+   │ • clean (no vuln) → approve      │
+   │ • patched_available → approve    │
+   │   안전 버전으로 spec 재작성        │
+   │   예: ^1.7.0 → ^1.7.16            │
+   │ • KEV hit → HARD BLOCK            │
+   │   "이 패키지는 실제 exploit 됨,    │
+   │    설치 X. 대체 모듈: AAA, BBB"   │
+   │ • CVE 있는데 patch X → WARN       │
+   │   "취약점 있음, 사용자 결정 필요"  │
+   └─────────────────────────────────┘
+          │
+          ▼
+   approved spec ledger 신규 entry 작성
+   sha256:abc123... = {ecosystem: npm, pkg, version, ...}
+```
+
+### Phase 2 — Hook Enforcement (PreToolUse / `guard.sh`)
+
+```
+Claude 가 Bash 실행 요청: "npm install @jackwener/opencli@^1.7.16"
+        │
+        ▼
+   ┌─────────────────────────────────┐
+   │ guard.sh                        │
+   │ 1. 명령 파싱:                    │
+   │    ecosystem = npm               │
+   │    pkg = @jackwener/opencli      │
+   │    version_range = ^1.7.16       │
+   │ 2. spec hash 계산                │
+   │ 3. ledger 조회                   │
+   └────────────┬────────────────────┘
+                │
+       ┌────────┴────────┐
+       ▼                 ▼
+   ledger hit          ledger miss
+   (approved +         (또는 expired)
+    not expired)            │
+       │                    ▼
+       ▼            ┌──────────────────────┐
+   PASS             │ BLOCK + Claude 한테    │
+   (명령 실행)       │ 안내:                  │
+                    │ "이 패키지가 advisory  │
+                    │  gate 통과 안 됨.      │
+                    │  safedeps check ...    │
+                    │  먼저 실행해서 spec    │
+                    │  approve 해야 함"      │
+                    └──────────────────────┘
+```
+
+### Phase 3 — Post-Install Rollback (PostToolUse / `verify.sh`)
+
+```
+install 완료 → verify.sh
+        │
+        ▼
+   ┌─────────────────────────────────────────┐
+   │ 1. lockfile 새 entry 추출                │
+   │ 2. 각 entry 의 spec hash 계산             │
+   │ 3. ledger 와 비교                         │
+   │ 4. install script / native binary 검사    │
+   │    (v1 reorg-guard 로직 그대로)           │
+   └────────────┬────────────────────────────┘
+                │
+       ┌────────┴────────┐
+       ▼                 ▼
+   spec 과 동일       diverged
+   + 의심 없음        (예: transitive dep
+       │              이 ledger 에 없는
+       ▼              버전으로 깔림,
+   CONFIRM            install script 의심,
+   (ledger 의         native binary 출현)
+   confirmed=true)         │
+                            ▼
+                   REORG (v1 engine):
+                   • lockfile ← 마지막 confirmed snapshot
+                   • rm -rf node_modules
+                   • npm install (재설치 = ledger 와 일치)
+                   • reorg.log 기록
+                   • Claude 한테 경고
+```
+
+---
+
+## 5. Threat Model (v2 갱신)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  SKILL.md          — 스킬 메타 + hook 선언 (Claude/Codex loader 가    │
-│                      읽는 SSoT)                                       │
+│  PHASE 1 — ADVISORY GATE (`safedeps check`)                          │
 ├─────────────────────────────────────────────────────────────────────┤
-│  README.md         — 사용자 install 가이드                            │
+│ • 알려진 CVE 매칭 (OSV.dev 기반, multi-ecosystem)                     │
+│ • KEV 매칭 시 hard-block (사용자 override 불가)                       │
+│ • patched_available 시 안전 버전으로 spec auto-rewrite                │
+│ • transitive dep 의 vuln 도 ledger 에 박아 sub-dep 침해 감지          │
 ├─────────────────────────────────────────────────────────────────────┤
-│  ARCHITECTURE.md   — 내부 흐름·설계 (이 문서)                          │
+│  PHASE 2 — HOOK ENFORCEMENT (`guard.sh`)                             │
 ├─────────────────────────────────────────────────────────────────────┤
-│  scripts/guard.sh  — PreToolUse — 명령 분류 + 사전 차단 +              │
-│                      lockfile snapshot                                │
+│ v1 의 hardcoded pattern 결도 유지 (defense-in-depth):                 │
+│ • typosquat 명단 매치                                                 │
+│ • curl|bash 류 pipe execution                                         │
+│ • 비표준 --registry URL                                               │
+│ • install script safety disabling                                     │
+│ • eval / subshell indirection                                         │
+│ + 새로운 enforcement:                                                  │
+│ • spec hash 가 ledger 에 없거나 expired → BLOCK + advisory gate 안내   │
 ├─────────────────────────────────────────────────────────────────────┤
-│  scripts/verify.sh — PostToolUse — lockfile diff + install script /   │
-│                      node_modules 검사 + reorg (rollback) 결정         │
+│  PHASE 3 — POST-INSTALL REORG (`verify.sh`)                          │
+├─────────────────────────────────────────────────────────────────────┤
+│ • install script 의 network/code execution/sensitive path 검사        │
+│ • base64/hex obfuscation                                              │
+│ • 비표준 registry resolved URL                                        │
+│ • 50+ dep explosion                                                   │
+│ • native binary 출현                                                  │
+│ • lockfile entry 가 approved spec 과 diverged → REORG                 │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-각 스크립트는 **stdin 으로 hook 입력 JSON 받음** (Claude Code spec):
+**막지 않는 것 (현재 한계)**:
+- ledger 의 approved_at 이후 새로 발견된 zero-day — daily re-check 로만 catch 가능, install 시점엔 못 잡음.
+- npm registry 자체의 손상.
+- 사용자가 `--allow-unverified` 명시 우회한 경우 (observable, log 기록).
 
-```json
-// guard.sh 가 받는 입력 (PreToolUse)
-{
-  "tool_name": "Bash",
-  "tool_input": { "command": "npm install foo" }
-}
+---
 
-// verify.sh 가 받는 입력 (PostToolUse)
-{
-  "tool_name": "Bash",
-  "tool_input": { "command": "npm install foo" },
-  "tool_response": { "success": true, ... }
-}
+## 6. Provider Failure Modes (No Silent Fallback)
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  OSV.dev 응답 무 / timeout                                          │
+│  ────────────────────                                               │
+│  • 1차: provider cache (local TTL 24h) 사용                          │
+│  • cache miss → fail-closed (block + "OSV 응답 없음, 재시도")        │
+│  • 사용자 explicit `--allow-unverified` 시만 우회 + log            │
+├────────────────────────────────────────────────────────────────────┤
+│  CISA KEV 응답 무                                                   │
+│  ────────────────────                                               │
+│  • KEV 는 매일 1회 download (정적 catalog), 로컬 cache 만 사용       │
+│  • 24h 이상 stale 시 경고                                           │
+├────────────────────────────────────────────────────────────────────┤
+│  GHSA / NVD 응답 무                                                 │
+│  ────────────────────                                               │
+│  • enrichment 결이라 fail-open 허용                                 │
+│  • OSV 결과로만 진행 + log 에 "GHSA cross-check skipped"            │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
-**출력**:
-- `exit 0` = pass (다음 단계 진행).
-- `exit 2` = block (Claude 에 reason 반환, 명령 실행 X).
-- stdout 에 JSON 반환 시 `systemMessage` / `decision` / `hookSpecificOutput` 으로 세밀 제어 가능 (Claude Code hook spec).
+설계 원칙: **silent fallback 금지**. 모든 우회는 observable + log. canonical truth (OSV) 가 응답 못 하면 default = fail-closed.
 
 ---
 
-## 6. Hook 등록 (settings.json)
+## 7. State Layout — `~/.safedeps/`
 
-`README.md` 의 install 섹션에 자세히. 핵심만:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          { "type": "command", "command": "~/.claude/skills/npm-reorg-guard/scripts/guard.sh", "timeout": 10 }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          { "type": "command", "command": "~/.claude/skills/npm-reorg-guard/scripts/verify.sh", "timeout": 30 }
-        ]
-      }
-    ]
-  }
-}
+```
+~/.safedeps/
+├── approved-specs/
+│   ├── sha256-abc123.json         ← 한 (ecosystem, package, version) 당 한 파일
+│   ├── sha256-def456.json
+│   └── ...
+│
+├── snapshots/                     ← v1 reorg snapshot 그대로 계승
+│   ├── 20260518-130000-xyz/
+│   │   ├── package-lock.json
+│   │   ├── yarn.lock
+│   │   ├── pnpm-lock.yaml
+│   │   ├── poetry.lock            ← v2 ecosystem 확장
+│   │   ├── uv.lock
+│   │   ├── Cargo.lock
+│   │   ├── go.sum
+│   │   ├── Gemfile.lock
+│   │   └── meta.json
+│   └── ...
+│
+├── confirmed_${dir_hash}          ← 프로젝트별 마지막 confirmed snapshot
+│
+├── cache/
+│   ├── osv/                       ← OSV query 응답 cache (24h TTL)
+│   │   └── npm-@jackwener-opencli-1.7.16.json
+│   └── kev/                       ← CISA KEV daily catalog
+│       └── kev-2026-05-18.json
+│
+├── locks/                         ← atomic state (TOCTOU 방지)
+├── reorg.log                      ← REORG event 기록 (append-only)
+└── advisory.log                   ← advisory gate event 기록 (block/approve)
 ```
 
-`matcher: "Bash"` 라 모든 Bash 명령에 hook 이 트리거됨 — 다만 guard.sh / verify.sh 가 내부에서 npm/pnpm/yarn/npx 패턴이 아니면 **즉시 graceful skip** (exit 0). 다른 Bash 명령에 성능 영향 거의 없음.
+설계 결정:
+- `approved-specs/` = ledger SSoT, JSON-per-spec (atomic write).
+- `snapshots/` = v1 결 그대로 + py/rust/go/ruby lockfile 추가.
+- `cache/osv/`, `cache/kev/` = provider 응답 cache (TTL).
+- `advisory.log` = advisory gate 의 모든 approve/block decision audit trail.
 
 ---
 
-## 7. 비교 — 기존 도구들과 결
+## 8. Multi-Ecosystem Support (v2 확장)
 
-| 도구 | 결 | npm-reorg-guard 와 차이 |
-|---|---|---|
-| `npm audit` | 알려진 CVE 매칭 | 사후 보고만, 자동 rollback X |
-| `socket.dev` | static + behavioral SaaS | 클라우드 의존, 무료 quota 한도 |
-| `lavamoat` | runtime sandbox | install 전 차단 X, 무거움 |
-| `pnpm onlyBuiltDependencies` | install script allowlist | typosquat / curl|bash X |
-| **npm-reorg-guard** | **install 전 차단 + 사후 검증 + 자동 reorg** | 단독 작동, 클라우드 0 |
+| Ecosystem | Manifest | Lockfile | safedeps check 명령 |
+|---|---|---|---|
+| npm | `package.json` | `package-lock.json` | `safedeps check npm <pkg>@<range>` |
+| yarn | `package.json` | `yarn.lock` | `safedeps check npm <pkg>@<range>` (OSV 공통) |
+| pnpm | `package.json` | `pnpm-lock.yaml` | `safedeps check npm <pkg>@<range>` |
+| pip (Poetry) | `pyproject.toml` | `poetry.lock` | `safedeps check pypi <pkg>@<range>` |
+| pip (uv) | `pyproject.toml` | `uv.lock` | `safedeps check pypi <pkg>@<range>` |
+| pip (Pipenv) | `Pipfile` | `Pipfile.lock` | `safedeps check pypi <pkg>@<range>` |
+| pip (raw) | `requirements.txt` | (약함) | `safedeps check pypi <pkg>@<range>` |
+| cargo | `Cargo.toml` | `Cargo.lock` | `safedeps check crates.io <pkg>@<range>` |
+| go | `go.mod` | `go.sum` | `safedeps check go <pkg>@<range>` |
+| ruby | `Gemfile` | `Gemfile.lock` | `safedeps check rubygems <pkg>@<range>` |
+| maven | `pom.xml` | (해당 디렉토리) | `safedeps check maven <group>:<artifact>@<range>` |
+| nuget | `*.csproj` | `packages.lock.json` | `safedeps check nuget <pkg>@<range>` |
 
-설계 영감: **Blockchain reorg** 의 "잘못된 블록은 chain 에서 분기 잘라내고 마지막 안전 지점으로 복원" 개념을 npm 의 lockfile chain 에 그대로 적용.
+각 ecosystem 의 typosquat 명단·install script 위험 패턴은 별도 정적 list 로. OSV.dev 가 ecosystem 정규화를 표준화해줘서 single API 결로 모두 cover.
 
 ---
 
-## 8. 운영 로그
+## 9. 컴포넌트 책임 분리 (SoC)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  SKILL.md             — Claude/Codex skill loader 가 읽는 SSoT.       │
+│                         hook 선언 + advisory gate 사용법 안내.         │
+├─────────────────────────────────────────────────────────────────────┤
+│  README.md            — 사용자 install 가이드.                         │
+├─────────────────────────────────────────────────────────────────────┤
+│  ARCHITECTURE.md      — 이 문서. 내부 흐름·설계.                       │
+├─────────────────────────────────────────────────────────────────────┤
+│  bin/safedeps         — CLI entry (advisory check, ledger 관리,        │
+│                         재검증 등).                                    │
+├─────────────────────────────────────────────────────────────────────┤
+│  scripts/guard.sh     — PreToolUse hook. ledger 일치 검증 + v1 의      │
+│                         hardcoded pattern.                            │
+├─────────────────────────────────────────────────────────────────────┤
+│  scripts/verify.sh    — PostToolUse hook. lockfile diff + spec 비교    │
+│                         + reorg.                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│  lib/providers/       — OSV / KEV / GHSA / NVD / deps.dev / Snyk      │
+│                         adapter. 하나의 query interface.               │
+├─────────────────────────────────────────────────────────────────────┤
+│  lib/ledger/          — approved spec ledger I/O. atomic write,        │
+│                         hash 계산, TTL 검사.                           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 10. 비교 — 기존 도구들과 결 (정확화)
+
+| 도구 | 결 | 동작 시점 | safedeps 와 차이 |
+|---|---|---|---|
+| `npm audit` | materialized lock 기반 취약점 보고 | post-install | spec 결정 / 차단 안 함, **보고만** |
+| `pip-audit` / `cargo audit` / `bundler-audit` | 같은 결, 다른 ecosystem | post-install | 같음 |
+| **socket.dev** | SaaS risk intelligence (behavioral + static) | pre-install + post-install | 클라우드 의존, 무료 quota 한도, **외부 SaaS** |
+| **lavamoat** | runtime permission containment (sandbox) | runtime | install 전 차단 X, **무겁고 dev 단계 부담** |
+| **pnpm `onlyBuiltDependencies`** | lifecycle script allowlist | install 단계 | typosquat / vuln DB X, **script 차단만** |
+| **deps.dev** | package graph metadata | query only | active gate 아님, **데이터만** |
+| **OSV-Scanner** | OSV 결 lockfile 스캔 | post-install (CI) | spec gate X, **lockfile 리포트만** |
+| **GitHub Dependabot** | PR 기반 dep update 권장 | repo-level (PR) | local install 차단 X, **PR 단계만** |
+| **`safedeps` (이것)** | **advisory gate + approved spec ledger + post-install reorg** | **pre-install + install + post-install** | **3-phase, multi-ecosystem, 로컬 first** |
+
+차별점 요약:
+- 다른 도구는 \"보고\" / \"sandbox\" / \"script 차단\" / \"PR 권장\" 중 하나에 집중.
+- safedeps 는 **\"advisory gate (Phase 1) → hook enforcement (Phase 2) → reorg fallback (Phase 3)\" 의 3겹 defense-in-depth**.
+- Snyk / socket.dev 와 달리 **SaaS 의존 X, 로컬 + 공개 DB (OSV/KEV/GHSA) 만**.
+
+---
+
+## 11. 운영 로그
 
 ```bash
-# 모든 reorg event 확인
-cat ~/.npm-reorg-guard/reorg.log
+# advisory gate decision (approve / block)
+tail -f ~/.safedeps/advisory.log
 
-# 현 프로젝트의 confirmed snapshot ID
-DIR_HASH=$(echo -n "$(pwd)" | shasum -a 256 | awk '{print $1}')
-cat ~/.npm-reorg-guard/confirmed_${DIR_HASH}
+# reorg event
+tail -f ~/.safedeps/reorg.log
 
-# snapshot chain 탐색
-ls -lt ~/.npm-reorg-guard/snapshots/
+# 현재 approved specs
+ls -lt ~/.safedeps/approved-specs/
+
+# 특정 spec 의 evidence
+cat ~/.safedeps/approved-specs/sha256-abc123.json | jq '.evidence'
+
+# expired specs (만료된 거 재검증 필요)
+find ~/.safedeps/approved-specs -name '*.json' -exec jq -r 'select(.expires_at < now) | "\(.package)@\(.version) expired \(.expires_at)"' {} \;
+
+# OSV cache 비우기 (강제 re-query)
+rm -rf ~/.safedeps/cache/osv/
 ```
 
 ---
 
-## 9. 한계와 미래 방향
+## 12. v1 → v2 마이그레이션
 
-**현재 한계**:
-- npm registry 자체가 손상되면 (Snyk 2018 event_stream 케이스) 우리도 못 잡음.
-- 이미 confirmed 된 패키지의 zero-day 는 detection 후속 reorg 불가능.
-- detection rule 이 정적 패턴 매칭 — adversarial 회피 가능.
+```
+v1 (npm-reorg-guard)                v2 (safedeps)
+────────────────────                ──────────────
 
-**가능한 확장**:
-- `socket.dev` / OSV.dev / GitHub Advisory 같은 외부 DB 와 cross-check.
-- 의존성 트리 anomaly (갑자기 transitive dep 폭증) detection.
-- 사용자 confirmed 한 snapshot 들 간의 diff visualization UI.
-- multi-machine sync (여러 dev 머신에서 confirmed snapshot 공유).
+~/.npm-reorg-guard/        →        ~/.safedeps/
+~/.claude/skills/                   ~/.claude/skills/
+  npm-reorg-guard/         →          safedeps/
+                                      (symlink 호환 유지: npm-reorg-guard → safedeps)
+
+scripts/guard.sh           →        scripts/guard.sh
+  (typosquat / pattern               + ledger lookup
+   매칭만)                            + v1 pattern 유지
+
+scripts/verify.sh          →        scripts/verify.sh
+  (lockfile diff + reorg)            + approved spec diff
+                                      + v1 reorg 유지
+
+(없음)                     →        bin/safedeps  ← 새 CLI
+                                      check / approve / revoke /
+                                      re-check / ledger
+
+(없음)                     →        lib/providers/  ← OSV / KEV / GHSA / ...
+(없음)                     →        lib/ledger/    ← approved spec I/O
+
+GitHub repo:
+  aldegad/npm-reorg-guard  →        aldegad/safedeps
+                                      (old name redirect 유지)
+```
+
+v1 호환:
+- v1 hook 등록 path (`~/.claude/skills/npm-reorg-guard/scripts/*.sh`) 그대로 작동하는 symlink 유지.
+- v1 의 `~/.npm-reorg-guard/` 디렉토리 발견 시 자동 `~/.safedeps/` 으로 마이그레이션 (snapshot chain 보존).
+- v1 사용자는 `safedeps migrate` 한 줄로 ledger 신규 생성 + 기존 confirmed snapshot 들을 그대로 approved spec 으로 변환.
+
+---
+
+## 13. 한계 + 미래 방향
+
+**현재 한계 (v2 첫 출시)**:
+- approved_at 이후 발견된 zero-day 는 daily re-check 로만 catch.
+- npm/PyPI 같은 registry 자체 손상 시 우리도 못 막음.
+- KEV 는 24h 단위 update — 그 사이 새 KEV 등재 못 잡음.
+- transitive dep 의 vuln 검사는 ledger 폭증 가능 (수백 개 dep). 최적화 필요.
+
+**미래 확장**:
+- **plugin model** — 사용자 정의 provider (회사 내부 vuln DB, private registry).
+- **policy file** — `.safedeps.toml` 로 \"우리 팀 정책: KEV hit 자동 block, CVSS 7+ 는 사용자 컨펌\" 같이 명시.
+- **CI mode** — `safedeps check --ci` 로 GitHub Actions / CircleCI 등에서 fail fast.
+- **multi-machine ledger sync** — 팀 차원의 approved spec 공유.
+- **deps.dev graph 활용** — transitive dep 의 \"위험 score\" 시각화.
+- **AI agent integration** — Claude / Codex 가 \"이 패키지 알려진 vuln 있음, 대체 모듈 X 권장\" 결로 직접 제안.
+
+---
+
+*문서 history*: v1 (`npm-reorg-guard`) 2026-05-18 작성 → v2 (`safedeps`) 2026-05-18 재작성. 코덱시 (surface:195) 와 클로디시 (surface:61) peer-question 합의안 기반.
