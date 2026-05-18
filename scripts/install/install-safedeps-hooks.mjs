@@ -106,6 +106,25 @@ function removeHook(config, eventName, command) {
   return changed;
 }
 
+function pruneLegacySafedepsHooks(config, eventName) {
+  const buckets = config?.hooks?.[eventName];
+  if (!Array.isArray(buckets)) return false;
+  let changed = false;
+  for (const bucket of buckets) {
+    if (!bucket || bucket.matcher !== "Bash" || !Array.isArray(bucket.hooks)) continue;
+    const before = bucket.hooks.length;
+    bucket.hooks = bucket.hooks.filter((h) => {
+      const command = h?.command;
+      if (typeof command !== "string") return true;
+      const legacySafedeps = command.includes("npm-reorg-guard") || command.includes("/safedeps/");
+      const legacyHookName = command.endsWith("/scripts/guard.sh") || command.endsWith("/scripts/verify.sh");
+      return !(legacySafedeps && legacyHookName);
+    });
+    if (bucket.hooks.length !== before) changed = true;
+  }
+  return changed;
+}
+
 function installInEngine({ engineRoot, configPath, label }) {
   if (!existsSync(engineRoot)) {
     warn(`skip ${label} (${engineRoot} not present)`);
@@ -133,11 +152,13 @@ function installInEngine({ engineRoot, configPath, label }) {
   ensureSymlink(REPO_ROOT, skillLink);
 
   const cfg = readJson(configPath);
+  const legacyPreRemoved = pruneLegacySafedepsHooks(cfg, "PreToolUse");
+  const legacyPostRemoved = pruneLegacySafedepsHooks(cfg, "PostToolUse");
   const preAdded = ensureHook(cfg, "PreToolUse", PRE_HOOK);
   const postAdded = ensureHook(cfg, "PostToolUse", POST_HOOK);
-  if (preAdded || postAdded) {
+  if (legacyPreRemoved || legacyPostRemoved || preAdded || postAdded) {
     writeJsonWithBackup(configPath, cfg);
-    log(`patched ${configPath} (pre=${preAdded ? "added" : "ok"}, post=${postAdded ? "added" : "ok"})`);
+    log(`patched ${configPath} (pre=${preAdded ? "added" : "ok"}, post=${postAdded ? "added" : "ok"}, legacy=${legacyPreRemoved || legacyPostRemoved ? "removed" : "ok"})`);
   } else {
     log(`config ok   ${configPath} (hooks already registered)`);
   }

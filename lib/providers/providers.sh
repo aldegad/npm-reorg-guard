@@ -44,6 +44,13 @@ safedeps_require_http_client() {
   fi
 }
 
+safedeps_provider_mktemp_dir() {
+  local tmp_root="${TMPDIR:-/tmp}"
+
+  mkdir -p "${tmp_root}" || return 1
+  mktemp -d "${tmp_root%/}/safedeps-providers.XXXXXX"
+}
+
 safedeps_now_iso() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
@@ -364,7 +371,31 @@ safedeps_providers_query() {
 
   safedeps_require_json_tools || return 1
   queried_at=$(safedeps_now_iso)
-  temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/safedeps-providers.XXXXXX")
+  if ! temp_dir=$(safedeps_provider_mktemp_dir); then
+    safedeps_provider_log "ERROR" "provider temp dir creation failed tmpdir=${TMPDIR:-/tmp}"
+    jq -cn \
+      --arg ecosystem "${ecosystem}" \
+      --arg package "${package_name}" \
+      --arg version "${version}" \
+      --arg queried_at "${queried_at}" \
+      '{
+        ecosystem: $ecosystem,
+        package: $package,
+        version: $version,
+        queried_at: $queried_at,
+        status: "blocked",
+        reason: "provider temp dir creation failed",
+        vulnerabilities: [],
+        kev: {queried_at: $queried_at, status: "not_queried", exploited: false, matches: []},
+        advisories: [],
+        provider_status: {
+          osv: {status: "failed_closed"},
+          kev: {status: "not_queried"},
+          ghsa: {status: "not_queried"}
+        }
+      }'
+    return 1
+  fi
 
   osv_file="${temp_dir}/osv.json"
   kev_file="${temp_dir}/kev.json"

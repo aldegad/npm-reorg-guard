@@ -23,6 +23,7 @@ safedeps check <ecosystem> <pkg>@<version|range> [--json]
 safedeps ledger [--json]
 safedeps revoke <hash> | <ecosystem> <pkg>@<version> | <pkg>@<version> [--reason <r>] [--json]
 safedeps re-check [--json]
+safedeps migrate [--keep-legacy]
 safedeps help [command]
 safedeps version
 ```
@@ -93,6 +94,8 @@ You are the primary user of this skill when you propose `npm install`, `pip inst
 `revoke` returns `{ "command": "revoke", "revoked": true, "reason": "...", "spec": {...} }`.
 
 `re-check` returns `{ "command": "re-check", "checked": N, "still_clean": N, "newly_vulnerable": [...], "kev_hit": [...], "revoked": [...] }`.
+
+`migrate` returns `{ "migrated": bool, "legacyRoot": "...", "targetRoot": "...", "copied": N, "skipped": N, "archivedAs": "..." }`.
 
 ### When the hook blocks you
 

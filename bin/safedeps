@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-SAFEDEPS_VERSION="2.1.0-cli"
+SAFEDEPS_VERSION="2.1.0"
 
 # ---- repo / lib bootstrap ----------------------------------------------------
 
@@ -672,6 +672,36 @@ cmd_recheck() {
   [[ "${kv}" -gt 0 ]] && sf_err  "KEV 매치로 ${kv} 개 revoke"
 }
 
+# ---- migrate -----------------------------------------------------------------
+
+cmd_migrate() {
+  local keep_legacy=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --keep-legacy) keep_legacy=1; shift ;;
+      -h|--help) cmd_help migrate; return 0 ;;
+      *) sf_eprintf "safedeps: unexpected arg for migrate: $1"; return 4 ;;
+    esac
+  done
+
+  if ! command -v node >/dev/null 2>&1; then
+    sf_eprintf "safedeps: node is required for state migration"
+    return 4
+  fi
+
+  local migrate_script="${SAFEDEPS_REPO_DIR}/scripts/install/migrate-safedeps-state.mjs"
+  [[ -f "${migrate_script}" ]] || {
+    sf_eprintf "safedeps: migration script not found: ${migrate_script}"
+    return 4
+  }
+
+  if [[ "${keep_legacy}" -eq 1 ]]; then
+    node "${migrate_script}" --keep-legacy
+  else
+    node "${migrate_script}"
+  fi
+}
+
 # ---- help / version ----------------------------------------------------------
 
 cmd_version() {
@@ -720,6 +750,14 @@ safedeps re-check [--json]
   Auto-revoke entries that newly match a CVE or KEV.
 EOF
       ;;
+    migrate)
+      cat <<'EOF'
+safedeps migrate [--keep-legacy]
+
+  Migrate legacy ~/.npm-reorg-guard state into ~/.safedeps.
+  By default the legacy directory is archived to remove the old active truth path.
+EOF
+      ;;
     *)
       cat <<EOF
 safedeps ${SAFEDEPS_VERSION} — multi-ecosystem install safety gate
@@ -732,6 +770,7 @@ COMMANDS
   ledger                                    List approved specs.
   revoke <hash | pkg@version>               Revoke an approved spec.
   re-check                                  Re-query providers for all approved specs.
+  migrate                                   Migrate legacy npm-reorg-guard state.
   help [command]                            Show help.
   version                                   Print version.
 
@@ -790,6 +829,7 @@ main() {
     ledger)   cmd_ledger   "$@" ;;
     revoke)   cmd_revoke   "$@" ;;
     re-check|recheck) cmd_recheck "$@" ;;
+    migrate)  cmd_migrate  "$@" ;;
     help)     cmd_help     "$@" ;;
     version)  cmd_version ;;
     *)

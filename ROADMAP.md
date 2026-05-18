@@ -56,28 +56,32 @@ OS-level (nginx / apt / brew / system binary) 은 **별도 도구로 분리**. S
 |---|---|---|
 | **v2.0-doc** ✅ | `ARCHITECTURE.md` v2 작성·push | — |
 | **v2.0-roadmap** ✅ | 이 문서 | — |
-| **v2.1-rename** | GitHub repo rename `aldegad/npm-reorg-guard` → `aldegad/safedeps` ✅. 로컬 repo/skill id/path `safedeps` ✅. 로컬 `~/.npm-reorg-guard/` → `~/.safedeps/` 마이그레이션 스크립트와 사용자 settings hook path 업데이트는 남음. | v2.0-doc |
-| **v2.1-providers** | `lib/providers/` 신규 — OSV / KEV / GHSA adapter. 단일 query interface. 응답 cache (TTL 24h). | — |
-| **v2.1-ledger** | `lib/ledger/` 신규 — approved spec JSON I/O (atomic write, hash 계산, TTL 검사). | v2.1-providers |
-| **v2.1-cli** | `bin/safedeps` 신규 — `check`, `approve`, `revoke`, `re-check`, `migrate` 서브커맨드. | v2.1-providers, v2.1-ledger |
-| **v2.1-guard-patch** | `scripts/safedeps-pre-guard.sh` 갱신 — ledger 일치 검증 추가 + v1 pattern 유지. | v2.1-ledger |
-| **v2.1-verify-patch** | `scripts/safedeps-post-verify.sh` 갱신 — approved spec 과 lockfile diff 비교 추가 + v1 reorg 유지. | v2.1-ledger |
+| **v2.1-rename** ✅ | GitHub repo rename `aldegad/npm-reorg-guard` → `aldegad/safedeps` ✅. 로컬 repo/skill id/path `safedeps` ✅. `safedeps migrate` 로 legacy `~/.npm-reorg-guard` → `~/.safedeps` 이전 + legacy hook cleanup. | v2.0-doc |
+| **v2.1-providers** ✅ | `lib/providers/` 신규 — OSV / KEV / GHSA adapter. 단일 query interface. 응답 cache (TTL 24h). | — |
+| **v2.1-ledger** ✅ | `lib/ledger/` 신규 — approved spec JSON I/O (atomic write, hash 계산, TTL 검사). | v2.1-providers |
+| **v2.1-cli** ✅ | `bin/safedeps` 신규 — `check`, `ledger`, `revoke`, `re-check`, `migrate`, `version` 서브커맨드. | v2.1-providers, v2.1-ledger |
+| **v2.1-guard-patch** ✅ | `scripts/safedeps-pre-guard.sh` 갱신 — ledger 일치 검증 추가 + v1 pattern 유지. | v2.1-ledger |
+| **v2.1-verify-patch** ✅ | `scripts/safedeps-post-verify.sh` 갱신 — approved spec 과 lockfile diff 비교 추가 + v1 reorg 유지. | v2.1-ledger |
 | **v2.1-multi-ecosystem** ✅ | pip / cargo / go / gem / maven / nuget 명령 파싱 + lockfile snapshot. `safedeps-pre-guard.sh` 는 install 분류와 typosquat pattern 을 확장했고, `safedeps-post-verify.sh` 는 monitored dependency files 기준으로 rollback truth 를 공유한다. | v2.1-guard-patch |
-| **v2.1-hook-rename** | hook 파일 namespacing (`guard.sh` → `safedeps-pre-guard.sh`, `verify.sh` → `safedeps-post-verify.sh`) + cross-engine installer (`scripts/install/install-safedeps-hooks.mjs`, ~/.claude + ~/.codex 자동 등록, idempotent, --uninstall). | v2.1-cli |
-| **v2.1-recheck-cron** | daily re-check cron — 전체 approved spec 재 query → 새 CVE 매치 시 revoke + 사용자 알람. | v2.1-providers, v2.1-ledger |
-| **v2.1-tests** | end-to-end 테스트 — fixture vuln DB 응답 → 명령 시뮬레이션 → ledger / hook 동작 검증. | 모든 v2.1 |
+| **v2.1-hook-rename** ✅ | hook 파일 namespacing (`guard.sh` → `safedeps-pre-guard.sh`, `verify.sh` → `safedeps-post-verify.sh`) + cross-engine installer (`scripts/install/install-safedeps-hooks.mjs`, ~/.claude + ~/.codex 자동 등록, idempotent, --uninstall). | v2.1-cli |
+| **v2.1-recheck-cron** ✅ | daily re-check launchd — 전체 approved spec 재 query → 새 CVE/KEV/provider-skip 시 revoke + macOS 알림. | v2.1-providers, v2.1-ledger |
+| **v2.1-tests** ✅ | end-to-end 테스트 — fixture provider 응답 → 명령 시뮬레이션 → ledger / hook / re-check / migration 동작 검증. | 모든 v2.1 |
 | **v2.1-release** | npm package publish (`@aldegad/safedeps`) + GitHub release v2.1.0. | 모든 v2.1 |
+
+### 2026-05-18 릴리즈 전 정리 메모
+
+- npm package metadata 는 v2.1.0 기준으로 정합화한다 (`package.json` version + `bin.safedeps`).
+- `npm test` 는 release smoke suite 를 실행한다. full fixture E2E 는 `v2.1-tests` 후속으로 남긴다.
+- daily re-check 는 토큰을 쓰지 않는다. 알렉스가 opt-in 하면 macOS `launchd` user agent 로 `safedeps re-check --json` 을 매일 실행하는 구조가 기본이다. 네트워크는 OSV/CISA/GHSA provider query 에만 사용된다.
+- 실제 local background job 은 `scripts/install/install-safedeps-recheck-agent.mjs` 로 atomic install 한다. wrapper 는 `~/.safedeps/recheck.log` 와 `~/.safedeps/recheck-alerts.jsonl` 를 쓰고, 새 CVE/KEV/revoke/provider-skip 이 있으면 macOS notification 을 띄운다.
+
+### 후속 로드맵 — 전체 workspace inventory audit
+
+전체 repo/lockfile inventory scan 은 safedeps v2.1 daily re-check 와 분리한다. 후보 설계는 최초 one-shot inventory scan 으로 workspace 의 manifest/lockfile 을 발견하고, 사용자가 채택한 spec 만 approved ledger 또는 별도 inventory ledger 에 넣은 뒤 주기 re-check 대상으로 삼는 방식이다. 이렇게 해야 safedeps 의 현재 책임인 install approval gate 와 이미 디스크에 존재하는 dependency audit 의 책임 소재가 섞이지 않는다.
 
 ### 우선순위
 
-1. v2.1-rename 잔여분 (state migration + 사용자 settings hook path 업데이트)
-2. v2.1-providers (OSV adapter — 가장 핵심)
-3. v2.1-ledger (provider 응답 저장소)
-4. v2.1-cli + v2.1-guard-patch (사용자 entry + hook)
-5. v2.1-verify-patch (post-install 강화)
-6. v2.1-multi-ecosystem (npm 만 동작 검증 후 확장)
-7. v2.1-recheck-cron (lifecycle 완성)
-8. v2.1-tests + v2.1-release
+1. v2.1-release: commit / tag / GitHub release / npm publish.
 
 ---
 

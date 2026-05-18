@@ -1,6 +1,6 @@
 # Safedeps
 
-> Dependency install safety gate -- advisory checks, approved spec enforcement, and auto-rollback suspicious package installs in Claude Code.
+> Dependency install safety gate -- advisory checks, approved spec enforcement, and auto-rollback suspicious package installs in Claude Code and Codex CLI.
 
 ## Why "reorg"?
 
@@ -10,7 +10,7 @@ No manual review. No leftover malicious code. Fully automatic.
 
 ## How It Works
 
-`safedeps` plugs into [Claude Code's hook system](https://docs.anthropic.com/en/docs/claude-code/hooks) as a pair of **PreToolUse** and **PostToolUse** hooks that wrap every package install command.
+`safedeps` plugs into Claude Code and Codex CLI hooks as a pair of **PreToolUse** and **PostToolUse** hooks that wrap package install commands. The CLI owns provider lookups and the approved-spec ledger; hooks enforce that ledger and run post-install rollback checks.
 
 ```
                          PreToolUse                          PostToolUse
@@ -122,10 +122,18 @@ sudo apt-get install jq
 
 ```bash
 git clone https://github.com/aldegad/safedeps.git
-cp -r safedeps ~/.claude/skills/
+cd safedeps
 ```
 
-**2. Add hooks to your Claude Code settings:**
+**2. Install the skill + hooks:**
+
+```bash
+node scripts/install/install-safedeps-hooks.mjs
+```
+
+The installer is idempotent. It symlinks the skill into `~/.claude/skills/safedeps` and `~/.codex/skills/safedeps` when those roots exist, patches the matching hook config, and can also place `safedeps` on PATH through `~/.local/bin`.
+
+**3. Manual hook registration, if needed:**
 
 Edit `.claude/settings.json` (project-level) or `~/.claude/settings.json` (global):
 
@@ -158,14 +166,42 @@ Edit `.claude/settings.json` (project-level) or `~/.claude/settings.json` (globa
 }
 ```
 
-**3. Verify permissions:**
+**4. Verify permissions:**
 
 ```bash
 chmod +x ~/.claude/skills/safedeps/scripts/safedeps-pre-guard.sh
 chmod +x ~/.claude/skills/safedeps/scripts/safedeps-post-verify.sh
 ```
 
-That's it. The guard activates automatically whenever Claude Code runs a package install command.
+That's it. The guard activates automatically whenever Claude Code or Codex CLI runs a package install command.
+
+### Daily Re-check With macOS Alerts
+
+Install a per-user LaunchAgent to re-check the approved-spec ledger once per day:
+
+```bash
+node scripts/install/install-safedeps-recheck-agent.mjs install --hour 9 --minute 0
+```
+
+This runs `safedeps re-check --json` against `~/.safedeps/approved-specs/`. It does not use LLM tokens; it only calls the advisory providers used by safedeps. If a new CVE/KEV is found, a spec is revoked, or a provider check is skipped, the wrapper writes `~/.safedeps/recheck-alerts.jsonl` and raises a macOS notification.
+
+Useful commands:
+
+```bash
+node scripts/install/install-safedeps-recheck-agent.mjs status
+node scripts/install/install-safedeps-recheck-agent.mjs uninstall
+tail -f ~/.safedeps/recheck.log
+```
+
+### Legacy State Migration
+
+If you used the old `npm-reorg-guard` state directory, migrate it once:
+
+```bash
+safedeps migrate
+```
+
+This copies missing state from `~/.npm-reorg-guard` into `~/.safedeps` and archives the legacy directory so there is no second active state root.
 
 ## Real-World Attack Coverage
 
@@ -216,11 +252,17 @@ Old unconfirmed snapshots are automatically pruned (keeping the 10 most recent),
 
 ```
 safedeps/
+  bin/
+    safedeps      # CLI -- advisory gate, ledger, revoke, re-check
+  lib/
+    providers/    # OSV / CISA KEV / GHSA adapters
+    ledger/       # approved-spec ledger
   scripts/
-    guard.sh      # PreToolUse hook -- snapshot + pre-flight checks
-    verify.sh     # PostToolUse hook -- post-install verification + reorg
+    safedeps-pre-guard.sh       # PreToolUse hook -- snapshot + ledger enforcement
+    safedeps-post-verify.sh     # PostToolUse hook -- post-install verification + reorg
+    install/install-safedeps-hooks.mjs
   package.json
-  skill.md        # Claude Code skill manifest
+  SKILL.md        # Claude Code / Codex skill manifest
   LICENSE         # Apache-2.0
 ```
 
