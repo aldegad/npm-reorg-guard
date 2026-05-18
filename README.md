@@ -1,6 +1,8 @@
 # Safedeps
 
-> Dependency install safety gate -- advisory checks, approved spec enforcement, and auto-rollback suspicious package installs in Claude Code and Codex CLI.
+> **Treat every install as an unconfirmed block — `safedeps` approves the safe ones, reorgs the rest.**
+>
+> Pre-approve dependency installs against OSV / CISA KEV / GitHub Advisory, enforce that approval from Claude Code and Codex CLI hooks, and auto-rollback any install that diverges from the approved spec. *(한국어 README → [README.ko.md](./README.ko.md))*
 
 ## Why "reorg"?
 
@@ -229,16 +231,6 @@ node scripts/install/install-safedeps-recheck-agent.mjs uninstall
 tail -f ~/.safedeps/recheck.log
 ```
 
-### Legacy State Migration
-
-If you used the old `npm-reorg-guard` state directory, migrate it once:
-
-```bash
-safedeps migrate
-```
-
-This copies missing state from `~/.npm-reorg-guard` into `~/.safedeps` and archives the legacy directory so there is no second active state root.
-
 ## Real-World Attack Coverage
 
 `safedeps` is designed to catch the patterns behind real supply-chain incidents:
@@ -305,6 +297,31 @@ safedeps/
   SKILL.md        # Claude Code / Codex skill manifest
   LICENSE         # Apache-2.0
 ```
+
+## What's Different
+
+`safedeps` intercepts package installs at **the moment an AI coding agent writes the install command** — not at CI scan time, PR review time, or runtime sandbox time. That timing is the core differentiator.
+
+Typical flow:
+
+1. The agent writes `npm install foo@1.2.3` (or any of the other supported install verbs).
+2. The PreToolUse hook checks whether that spec is in the approved-spec ledger. If not, it **blocks** the install and returns the exact `safedeps check npm foo@1.2.3` command the agent should run next, in the block reason.
+3. The agent runs `safedeps check`. The CLI queries OSV / CISA KEV / GitHub Advisory and, if safe, **adds the spec to the ledger**. KEV matches are hard-block (no override). CVEs with an available patch are auto-narrowed to the fixed version.
+4. The agent retries the install. The ledger entry now matches, so the install **proceeds**.
+5. After the install, the PostToolUse hook diffs the lockfile, checks install scripts and native binaries, and **auto-reorgs** to the last confirmed snapshot if anything diverged.
+
+With this loop, the agent cannot install arbitrary packages on demand. Every install is forced through an advisory check. The suspicious package a human would catch at PR review time is already caught at install time. No SaaS dependency — only the local CLI plus public databases (OSV / KEV / GHSA).
+
+## Legacy State Migration (v1 only)
+
+The v1 product was named `npm-reorg-guard` and used `~/.npm-reorg-guard/` as the state directory. v2 moves state to `~/.safedeps/`. A one-shot migration is provided:
+
+```bash
+safedeps migrate
+```
+
+- If `~/.npm-reorg-guard/` exists, it copies the snapshot chain, confirmed pointers, and logs into `~/.safedeps/` and archives the legacy directory so there is no second active state root.
+- If it does not exist, the command is a no-op (fresh v2 users do not need it).
 
 ## License
 
