@@ -1,16 +1,17 @@
 {
-  "name": "npm-reorg-guard",
+  "name": "safedeps",
   "version": "1.0.0",
-  "description": "Blockchain reorg concept applied to npm package security — Claude Code hooks that snapshot lock files and auto-rollback on suspicious changes",
-  "main": "scripts/guard.sh",
+  "description": "Dependency install safety gate with OSV-backed advisory checks, approved-spec ledger enforcement, and reorg rollback hooks",
+  "main": "bin/safedeps",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
-    "npm",
+    "safedeps",
     "security",
     "supply-chain",
-    "blockchain",
+    "advisory",
+    "osv",
     "reorg",
     "claude-code",
     "hooks",
@@ -21,6 +22,6 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/soohongkim/npm-reorg-guard.git"
+    "url": "https://github.com/aldegad/safedeps.git"
   }
 }

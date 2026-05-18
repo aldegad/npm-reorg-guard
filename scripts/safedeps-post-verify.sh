@@ -1,18 +1,42 @@
 #!/usr/bin/env bash
-# npm-reorg-guard: PostToolUse hook
-# Verifies lock file changes after npm install and performs reorg (rollback) if suspicious
+# safedeps: PostToolUse hook
+# Verifies dependency file changes after install commands and performs reorg (rollback) if suspicious
 
 set -euo pipefail
 
-GUARD_DIR="${HOME}/.npm-reorg-guard"
+GUARD_DIR="${SAFEDEPS_HOME:-${HOME}/.safedeps}"
 SNAPSHOT_DIR="${GUARD_DIR}/snapshots"
 STATE_LOCK_DIR="${GUARD_DIR}/state.lock"
+
+SAFEDEPS_LOCK_FILES=(
+  "package-lock.json"
+  "pnpm-lock.yaml"
+  "yarn.lock"
+  "poetry.lock"
+  "uv.lock"
+  "Pipfile.lock"
+  "requirements.txt"
+  "Cargo.lock"
+  "go.sum"
+  "Gemfile.lock"
+  "packages.lock.json"
+)
+
+SAFEDEPS_MANIFEST_FILES=(
+  "package.json"
+  "pyproject.toml"
+  "Pipfile"
+  "Cargo.toml"
+  "go.mod"
+  "Gemfile"
+  "pom.xml"
+)
 
 umask 077
 mkdir -p "${GUARD_DIR}" "${SNAPSHOT_DIR}"
 
 if ! command -v jq >/dev/null 2>&1; then
-  echo "npm-reorg-guard: jq is not installed; skipping verify hook." >&2
+  echo "safedeps: jq is not installed; skipping verify hook." >&2
   exit 0
 fi
 
@@ -28,7 +52,7 @@ acquire_state_lock() {
         local now
         now=$(date +%s)
         if [[ $(( now - lock_mtime )) -gt 60 ]]; then
-          echo "npm-reorg-guard: removing stale lock ($(( now - lock_mtime ))s old)." >&2
+          echo "safedeps: removing stale lock ($(( now - lock_mtime ))s old)." >&2
           rmdir "${STATE_LOCK_DIR}" 2>/dev/null || true
           continue
         fi
@@ -37,7 +61,7 @@ acquire_state_lock() {
 
     attempts=$((attempts + 1))
     if [[ ${attempts} -ge 100 ]]; then
-      echo "npm-reorg-guard: could not acquire state lock; skipping verify hook." >&2
+      echo "safedeps: could not acquire state lock; skipping verify hook." >&2
       exit 0
     fi
     sleep 0.1
@@ -109,6 +133,42 @@ files_differ() {
   fi
 
   ! diff -q "${left_path}" "${right_path}" >/dev/null 2>&1
+}
+
+monitored_files() {
+  local monitored_list="${SNAPSHOT_DIR}/${SNAPSHOT_ID}_monitored_files.list"
+  local file_name
+
+  if [[ -f "${monitored_list}" ]]; then
+    sort -u "${monitored_list}"
+    return
+  fi
+
+  for file_name in "${SAFEDEPS_LOCK_FILES[@]}" "${SAFEDEPS_MANIFEST_FILES[@]}"; do
+    printf '%s\n' "${file_name}"
+  done
+}
+
+restore_monitored_file() {
+  local file_name="$1"
+  local rollback_snapshot_id="$2"
+  local snapshot_file="${SNAPSHOT_DIR}/${rollback_snapshot_id}_${file_name}"
+  local missing_marker="${SNAPSHOT_DIR}/${rollback_snapshot_id}_${file_name}.missing"
+  local current_missing_marker="${SNAPSHOT_DIR}/${SNAPSHOT_ID}_${file_name}.missing"
+  local current_file="${PROJECT_DIR}/${file_name}"
+
+  if [[ -f "${snapshot_file}" ]]; then
+    if files_differ "${snapshot_file}" "${current_file}"; then
+      cp "${snapshot_file}" "${current_file}"
+      ROLLED_BACK+=("${file_name}")
+    fi
+    return
+  fi
+
+  if { [[ -f "${missing_marker}" ]] || [[ -f "${current_missing_marker}" ]]; } && [[ -f "${current_file}" ]]; then
+    rm -f "${current_file}"
+    ROLLED_BACK+=("${file_name}")
+  fi
 }
 
 read_confirmed_snapshot() {
@@ -212,7 +272,7 @@ cleanup_old_snapshots() {
       continue
     fi
 
-    if snapshot_is_protected "${old_id}" "${protected_snapshot_ids[@]}"; then
+    if [[ ${#protected_snapshot_ids[@]} -gt 0 ]] && snapshot_is_protected "${old_id}" "${protected_snapshot_ids[@]}"; then
       continue
     fi
 
@@ -308,7 +368,7 @@ check_postinstall_scripts() {
     return
   fi
 
-  for lock_file in "package-lock.json" "pnpm-lock.yaml" "yarn.lock"; do
+  for lock_file in "${SAFEDEPS_LOCK_FILES[@]}"; do
     if files_differ "${SNAPSHOT_DIR}/${SNAPSHOT_ID}_${lock_file}" "${PROJECT_DIR}/${lock_file}"; then
       changed_lock=true
       break
@@ -378,10 +438,9 @@ check_postinstall_scripts() {
 
 # Function: check lock file diff for suspicious changes
 check_lockfile_diff() {
-  local lock_files=("package-lock.json" "pnpm-lock.yaml" "yarn.lock")
   local lock_file
 
-  for lock_file in "${lock_files[@]}"; do
+  for lock_file in "${SAFEDEPS_LOCK_FILES[@]}"; do
     local current="${PROJECT_DIR}/${lock_file}"
     local snapshot="${SNAPSHOT_DIR}/${SNAPSHOT_ID}_${lock_file}"
 
@@ -401,21 +460,22 @@ check_lockfile_diff() {
       local new_deps
 
       # Check for resolved URLs pointing to non-standard registries
-      suspicious_urls=$(diff "${snapshot}" "${current}" 2>/dev/null | grep '^>' | grep '"resolved"' | grep -viE 'registry\.npmjs\.org|registry\.yarnpkg\.com' | head -5)
+      suspicious_urls=$(diff "${snapshot}" "${current}" 2>/dev/null | grep '^>' | grep '"resolved"' | grep -viE 'registry\.npmjs\.org|registry\.yarnpkg\.com' | head -5 || true)
       if [[ -n "${suspicious_urls}" ]]; then
         SUSPICIOUS=true
         REASONS+=("Lock file contains resolved URLs from non-standard registries")
       fi
 
       # Check for git:// or http:// (non-https) resolved URLs
-      insecure_urls=$(diff "${snapshot}" "${current}" 2>/dev/null | grep '^>' | grep '"resolved"' | grep -iE '(git://|http://)' | head -5)
+      insecure_urls=$(diff "${snapshot}" "${current}" 2>/dev/null | grep '^>' | grep '"resolved"' | grep -iE '(git://|http://)' | head -5 || true)
       if [[ -n "${insecure_urls}" ]]; then
         SUSPICIOUS=true
         REASONS+=("Lock file contains insecure (non-HTTPS) resolved URLs")
       fi
 
       # Check for a very large number of new dependencies (potential dependency confusion)
-      new_deps=$(diff "${snapshot}" "${current}" 2>/dev/null | grep '^>' | grep -c '"resolved"' || echo "0")
+      new_deps=$(diff "${snapshot}" "${current}" 2>/dev/null | grep '^>' | grep -c '"resolved"' || true)
+      new_deps="${new_deps:-0}"
       if [[ ${new_deps} -gt 50 ]]; then
         SUSPICIOUS=true
         REASONS+=("Unusually large number of new dependencies added: ${new_deps}")
@@ -461,22 +521,27 @@ if [[ "${SUSPICIOUS}" == "true" ]]; then
     ROLLBACK_SNAPSHOT_ID="${SNAPSHOT_ID}"
   fi
 
-  LOCK_FILES=("package-lock.json" "pnpm-lock.yaml" "yarn.lock")
   ROLLED_BACK=()
 
-  for lock_file in "${LOCK_FILES[@]}"; do
-    snapshot_lock="${SNAPSHOT_DIR}/${ROLLBACK_SNAPSHOT_ID}_${lock_file}"
-    current_lock="${PROJECT_DIR}/${lock_file}"
+  while IFS= read -r monitored_file; do
+    [[ -z "${monitored_file}" ]] && continue
+    restore_monitored_file "${monitored_file}" "${ROLLBACK_SNAPSHOT_ID}"
+  done < <(monitored_files)
 
-    if [[ ! -f "${snapshot_lock}" ]]; then
-      continue
-    fi
+  while IFS= read -r csproj_file; do
+    [[ -z "${csproj_file}" ]] && continue
+    restore_monitored_file "${csproj_file}" "${ROLLBACK_SNAPSHOT_ID}"
+  done < <(find "${PROJECT_DIR}" -maxdepth 1 -type f -name "*.csproj" -exec basename {} \; 2>/dev/null | sort)
 
-    if files_differ "${snapshot_lock}" "${current_lock}"; then
-      cp "${snapshot_lock}" "${current_lock}"
-      ROLLED_BACK+=("${lock_file}")
-    fi
-  done
+  while IFS= read -r snap_csproj; do
+    [[ -z "${snap_csproj}" ]] && continue
+    restore_monitored_file "${snap_csproj}" "${ROLLBACK_SNAPSHOT_ID}"
+  done < <(find "${SNAPSHOT_DIR}" -maxdepth 1 -type f -name "${ROLLBACK_SNAPSHOT_ID}_*.csproj" -exec basename {} \; 2>/dev/null | sed "s/^${ROLLBACK_SNAPSHOT_ID}_//" | sort)
+
+  while IFS= read -r missing_csproj; do
+    [[ -z "${missing_csproj}" ]] && continue
+    restore_monitored_file "${missing_csproj}" "${ROLLBACK_SNAPSHOT_ID}"
+  done < <(find "${SNAPSHOT_DIR}" -maxdepth 1 -type f -name "${ROLLBACK_SNAPSHOT_ID}_*.csproj.missing" -exec basename {} \; 2>/dev/null | sed "s/^${ROLLBACK_SNAPSHOT_ID}_//; s/\\.missing$//" | sort)
 
   # Restore package.json if it was modified
   rollback_package_json="${SNAPSHOT_DIR}/${ROLLBACK_SNAPSHOT_ID}_package.json"
@@ -508,7 +573,7 @@ if [[ "${SUSPICIOUS}" == "true" ]]; then
 LOG_EOF
 
   cat << EOF
-{"systemMessage": "npm-reorg-guard: 의심스러운 패키지 변경 감지, 마지막으로 confirmed 된 안전 스냅샷으로 롤백했습니다.\n\n감지된 문제:\n${REASON_STR%%; }\n\n롤백 기준 스냅샷: ${ROLLBACK_SNAPSHOT_ID}\n롤백된 파일: ${ROLLED_BACK_STR%, }\n${WARNING_STR:+\n추가 경고:\n${WARNING_STR%%; }}\n\n상세 로그: ${GUARD_DIR}/reorg.log"}
+{"systemMessage": "safedeps: 의심스러운 패키지 변경 감지, 마지막으로 confirmed 된 안전 스냅샷으로 롤백했습니다.\n\n감지된 문제:\n${REASON_STR%%; }\n\n롤백 기준 스냅샷: ${ROLLBACK_SNAPSHOT_ID}\n롤백된 파일: ${ROLLED_BACK_STR%, }\n${WARNING_STR:+\n추가 경고:\n${WARNING_STR%%; }}\n\n상세 로그: ${GUARD_DIR}/reorg.log"}
 EOF
   exit 0
 fi

@@ -21,7 +21,7 @@ OS-level (nginx / apt / brew / system binary) 은 **별도 도구로 분리**. S
 ## v1 (출시 완료)
 
 **이름**: `npm-reorg-guard`
-**Status**: shipped. GitHub `aldegad/npm-reorg-guard`.
+**Status**: shipped as v1. GitHub repo has since been renamed to `aldegad/safedeps`.
 
 - npm ecosystem 전용.
 - PreToolUse hook (guard.sh): typosquat / curl|bash / 비표준 registry 등 **hardcoded pattern** 차단.
@@ -37,8 +37,8 @@ OS-level (nginx / apt / brew / system binary) 은 **별도 도구로 분리**. S
 
 ## v2 — Safedeps (현재 작업 중)
 
-**이름**: `safedeps` (rename 예정), 내부 engine = `reorg-guard` (v1 자산 보존).
-**Status**: `ARCHITECTURE.md` v2 작성 완료, 코드 구현 시작 전.
+**이름**: `safedeps`, 내부 engine = `reorg-guard` (v1 자산 보존).
+**Status**: `ARCHITECTURE.md` v2 작성 완료, v2.1 provider/ledger 구현 시작.
 
 ### 핵심 변화
 - ecosystem 통합: npm / yarn / pnpm / pip (poetry, uv, pipenv) / cargo / go / gem / maven / nuget.
@@ -56,20 +56,21 @@ OS-level (nginx / apt / brew / system binary) 은 **별도 도구로 분리**. S
 |---|---|---|
 | **v2.0-doc** ✅ | `ARCHITECTURE.md` v2 작성·push | — |
 | **v2.0-roadmap** ✅ | 이 문서 | — |
-| **v2.1-rename** | GitHub repo rename `aldegad/npm-reorg-guard` → `aldegad/safedeps` (old name redirect 유지). 로컬 `~/.npm-reorg-guard/` → `~/.safedeps/` 마이그레이션 스크립트. skill symlink (`~/.claude/skills/safedeps/` + `npm-reorg-guard → safedeps` 호환). settings.json hook path 업데이트. | v2.0-doc |
+| **v2.1-rename** | GitHub repo rename `aldegad/npm-reorg-guard` → `aldegad/safedeps` ✅. 로컬 repo/skill id/path `safedeps` ✅. 로컬 `~/.npm-reorg-guard/` → `~/.safedeps/` 마이그레이션 스크립트와 사용자 settings hook path 업데이트는 남음. | v2.0-doc |
 | **v2.1-providers** | `lib/providers/` 신규 — OSV / KEV / GHSA adapter. 단일 query interface. 응답 cache (TTL 24h). | — |
 | **v2.1-ledger** | `lib/ledger/` 신규 — approved spec JSON I/O (atomic write, hash 계산, TTL 검사). | v2.1-providers |
 | **v2.1-cli** | `bin/safedeps` 신규 — `check`, `approve`, `revoke`, `re-check`, `migrate` 서브커맨드. | v2.1-providers, v2.1-ledger |
-| **v2.1-guard-patch** | `scripts/guard.sh` 갱신 — ledger 일치 검증 추가 + v1 pattern 유지. | v2.1-ledger |
-| **v2.1-verify-patch** | `scripts/verify.sh` 갱신 — approved spec 과 lockfile diff 비교 추가 + v1 reorg 유지. | v2.1-ledger |
-| **v2.1-multi-ecosystem** | pip / cargo / go / gem / maven / nuget 명령 파싱 + lockfile snapshot. | v2.1-guard-patch |
+| **v2.1-guard-patch** | `scripts/safedeps-pre-guard.sh` 갱신 — ledger 일치 검증 추가 + v1 pattern 유지. | v2.1-ledger |
+| **v2.1-verify-patch** | `scripts/safedeps-post-verify.sh` 갱신 — approved spec 과 lockfile diff 비교 추가 + v1 reorg 유지. | v2.1-ledger |
+| **v2.1-multi-ecosystem** ✅ | pip / cargo / go / gem / maven / nuget 명령 파싱 + lockfile snapshot. `safedeps-pre-guard.sh` 는 install 분류와 typosquat pattern 을 확장했고, `safedeps-post-verify.sh` 는 monitored dependency files 기준으로 rollback truth 를 공유한다. | v2.1-guard-patch |
+| **v2.1-hook-rename** | hook 파일 namespacing (`guard.sh` → `safedeps-pre-guard.sh`, `verify.sh` → `safedeps-post-verify.sh`) + cross-engine installer (`scripts/install/install-safedeps-hooks.mjs`, ~/.claude + ~/.codex 자동 등록, idempotent, --uninstall). | v2.1-cli |
 | **v2.1-recheck-cron** | daily re-check cron — 전체 approved spec 재 query → 새 CVE 매치 시 revoke + 사용자 알람. | v2.1-providers, v2.1-ledger |
 | **v2.1-tests** | end-to-end 테스트 — fixture vuln DB 응답 → 명령 시뮬레이션 → ledger / hook 동작 검증. | 모든 v2.1 |
 | **v2.1-release** | npm package publish (`@aldegad/safedeps`) + GitHub release v2.1.0. | 모든 v2.1 |
 
 ### 우선순위
 
-1. v2.1-rename (호환성 안전망 먼저)
+1. v2.1-rename 잔여분 (state migration + 사용자 settings hook path 업데이트)
 2. v2.1-providers (OSV adapter — 가장 핵심)
 3. v2.1-ledger (provider 응답 저장소)
 4. v2.1-cli + v2.1-guard-patch (사용자 entry + hook)

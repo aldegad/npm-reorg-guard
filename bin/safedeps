@@ -1,0 +1,795 @@
+#!/usr/bin/env bash
+# safedeps — multi-ecosystem dependency install safety gate (CLI).
+# Phase 1 advisory gate: OSV (canonical) + CISA KEV (overlay) + GHSA (enrichment)
+# → approved-spec ledger write. Hook (scripts/safedeps-pre-guard.sh,
+# scripts/safedeps-post-verify.sh) only
+# enforces the ledger; this CLI is the only place that talks to providers.
+
+set -euo pipefail
+
+SAFEDEPS_VERSION="2.1.0-cli"
+
+# ---- repo / lib bootstrap ----------------------------------------------------
+
+SAFEDEPS_BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SAFEDEPS_REPO_DIR=$(cd "${SAFEDEPS_BIN_DIR}/.." && pwd)
+
+# shellcheck source=../lib/providers/providers.sh
+source "${SAFEDEPS_REPO_DIR}/lib/providers/providers.sh"
+# shellcheck source=../lib/ledger/ledger.sh
+source "${SAFEDEPS_REPO_DIR}/lib/ledger/ledger.sh"
+
+SAFEDEPS_HOME="${SAFEDEPS_HOME:-${HOME}/.safedeps}"
+SAFEDEPS_LEDGER_DIR="${SAFEDEPS_LEDGER_DIR:-${SAFEDEPS_HOME}/approved-specs}"
+SAFEDEPS_ADVISORY_LOG="${SAFEDEPS_ADVISORY_LOG:-${SAFEDEPS_HOME}/advisory.log}"
+
+# ---- output mode -------------------------------------------------------------
+
+SAFEDEPS_JSON_MODE=0
+SAFEDEPS_NO_COLOR=0
+
+sf_color_init() {
+  if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]] || [[ "${SAFEDEPS_NO_COLOR}" -eq 1 ]] || [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 1 ]]; then
+    C_RED=''; C_YELLOW=''; C_GREEN=''; C_GRAY=''; C_BOLD=''; C_DIM=''; C_RESET=''
+  else
+    C_RED=$'\033[31m'
+    C_YELLOW=$'\033[33m'
+    C_GREEN=$'\033[32m'
+    C_GRAY=$'\033[90m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RESET=$'\033[0m'
+  fi
+}
+
+sf_human() { [[ "${SAFEDEPS_JSON_MODE}" -eq 0 ]]; }
+
+sf_info() { sf_human || return 0; printf '%s· %s%s\n' "${C_GRAY}" "$1" "${C_RESET}"; }
+sf_ok()   { sf_human || return 0; printf '%s✓ %s%s\n' "${C_GREEN}" "$1" "${C_RESET}"; }
+sf_warn() { sf_human || return 0; printf '%s⚠ %s%s\n' "${C_YELLOW}" "$1" "${C_RESET}"; }
+sf_err()  { sf_human || return 0; printf '%s✗ %s%s\n' "${C_RED}" "$1" "${C_RESET}"; }
+
+sf_eprintf() { printf '%s\n' "$*" >&2; }
+
+# Lightweight spinner. No-op in JSON mode or non-tty.
+SF_SPINNER_PID=""
+sf_spinner_start() {
+  sf_human || return 0
+  [[ -t 1 ]] || return 0
+  local label="$1"
+  (
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local i=0
+    while :; do
+      printf '\r%s%s%s %s' "${C_GRAY}" "${frames[$i]}" "${C_RESET}" "${label}" >&2
+      i=$(( (i + 1) % ${#frames[@]} ))
+      sleep 0.08
+    done
+  ) &
+  SF_SPINNER_PID=$!
+  disown "${SF_SPINNER_PID}" 2>/dev/null || true
+}
+
+sf_spinner_stop() {
+  [[ -n "${SF_SPINNER_PID}" ]] || return 0
+  kill "${SF_SPINNER_PID}" 2>/dev/null || true
+  wait "${SF_SPINNER_PID}" 2>/dev/null || true
+  SF_SPINNER_PID=""
+  sf_human && printf '\r\033[2K' >&2 || true
+}
+
+trap 'sf_spinner_stop' EXIT
+
+# ---- helpers -----------------------------------------------------------------
+
+sf_require_jq() {
+  if ! command -v jq >/dev/null 2>&1; then
+    sf_eprintf "safedeps: jq is required"
+    exit 4
+  fi
+}
+
+# parse "pkg@range" or "@scope/pkg@range" → pkg / range
+sf_parse_pkg_spec() {
+  local input="$1"
+  local pkg range
+  if [[ "${input}" =~ ^(.+)@([^@]+)$ ]]; then
+    pkg="${BASH_REMATCH[1]}"
+    range="${BASH_REMATCH[2]}"
+  else
+    pkg="${input}"
+    range=""
+  fi
+  printf '%s\n%s' "${pkg}" "${range}"
+}
+
+# heuristic — does this look like a semver range rather than a concrete version?
+sf_is_range() {
+  local v="$1"
+  [[ -z "${v}" ]] && return 1
+  case "${v}" in
+    \^*|\~*|\**|\>*|\<*|\=*) return 0 ;;
+  esac
+  [[ "${v}" == *"||"* ]] && return 0
+  [[ "${v}" == *" - "* ]] && return 0
+  return 1
+}
+
+# resolve a range to a concrete installable version via the ecosystem tool.
+# Caller is responsible for handling resolve failure (returns 1).
+sf_resolve_version() {
+  local ecosystem="$1" pkg="$2" range="$3"
+
+  if [[ -z "${range}" ]]; then
+    sf_eprintf "safedeps: missing version — usage: <ecosystem> <pkg>@<version|range>"
+    return 1
+  fi
+
+  if ! sf_is_range "${range}"; then
+    printf '%s' "${range}"
+    return 0
+  fi
+
+  case "${ecosystem}" in
+    npm)
+      if ! command -v npm >/dev/null 2>&1; then
+        sf_eprintf "safedeps: npm CLI required to resolve range '${range}' for ${pkg}"
+        return 1
+      fi
+      local resolved
+      resolved=$(npm view "${pkg}@${range}" version --json 2>/dev/null \
+        | jq -r 'if type=="array" then .[-1] elif type=="string" then . else empty end' 2>/dev/null) || true
+      [[ -n "${resolved}" ]] || {
+        sf_eprintf "safedeps: could not resolve ${pkg}@${range} via npm view"
+        return 1
+      }
+      printf '%s' "${resolved}"
+      ;;
+    *)
+      sf_eprintf "safedeps: range resolution for ecosystem '${ecosystem}' not implemented yet — pass a concrete version"
+      return 1
+      ;;
+  esac
+}
+
+# Extract lowest patched version greater than current_version from OSV vulns.
+# Echoes the patched version on stdout, or returns 1 if no usable fix.
+sf_extract_patched_version() {
+  local provider_json_file="$1" current_version="$2"
+  local fixed
+  fixed=$(jq -r '
+    [ .vulnerabilities[]?.affected[]?.ranges[]?.events[]?.fixed // empty ]
+    | unique
+    | .[]
+  ' "${provider_json_file}" 2>/dev/null)
+
+  [[ -z "${fixed}" ]] && return 1
+
+  local candidate=""
+  while IFS= read -r v; do
+    [[ -z "${v}" ]] && continue
+    # require v > current_version
+    local higher
+    higher=$(printf '%s\n%s\n' "${v}" "${current_version}" | sort -V | tail -1)
+    [[ "${higher}" != "${v}" || "${v}" == "${current_version}" ]] && continue
+    if [[ -z "${candidate}" ]]; then
+      candidate="${v}"
+    else
+      local lower
+      lower=$(printf '%s\n%s\n' "${candidate}" "${v}" | sort -V | head -1)
+      candidate="${lower}"
+    fi
+  done <<< "${fixed}"
+
+  [[ -n "${candidate}" ]] || return 1
+  printf '%s' "${candidate}"
+}
+
+sf_advisory_log() {
+  umask 077
+  mkdir -p "$(dirname "${SAFEDEPS_ADVISORY_LOG}")"
+  printf '[%s] %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$*" >> "${SAFEDEPS_ADVISORY_LOG}"
+}
+
+# Emit either JSON or human text. Both forms describe the same event.
+sf_emit_json() {
+  if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+    jq -c . <<< "$1"
+  fi
+}
+
+# ---- check -------------------------------------------------------------------
+
+cmd_check() {
+  local ecosystem="" pkg_spec=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) cmd_help check; return 0 ;;
+      --) shift; break ;;
+      -*) sf_eprintf "safedeps: unknown option for check: $1"; return 4 ;;
+      *)
+        if [[ -z "${ecosystem}" ]]; then ecosystem="$1"
+        elif [[ -z "${pkg_spec}" ]]; then pkg_spec="$1"
+        else sf_eprintf "safedeps: unexpected arg: $1"; return 4
+        fi
+        shift; continue
+        ;;
+    esac
+    shift
+  done
+
+  if [[ -z "${ecosystem}" || -z "${pkg_spec}" ]]; then
+    sf_eprintf "usage: safedeps check <ecosystem> <pkg>@<version|range> [--json]"
+    return 4
+  fi
+
+  sf_require_jq
+
+  local pkg range
+  pkg=$(sf_parse_pkg_spec "${pkg_spec}" | sed -n '1p')
+  range=$(sf_parse_pkg_spec "${pkg_spec}" | sed -n '2p')
+
+  local version
+  sf_spinner_start "버전 해석 중 (${pkg}@${range})"
+  if ! version=$(sf_resolve_version "${ecosystem}" "${pkg}" "${range}"); then
+    sf_spinner_stop
+    sf_err "버전 해석 실패: ${pkg}@${range}"
+    if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+      jq -nc --arg ecosystem "${ecosystem}" --arg package "${pkg}" --arg range "${range}" \
+        '{command:"check", ecosystem:$ecosystem, package:$package, input_range:$range, result:"error", error:"version_resolution_failed"}'
+    fi
+    return 4
+  fi
+  sf_spinner_stop
+
+  # Ledger lookup short-circuit
+  local ledger_check
+  if ledger_check=$(safedeps_ledger_check "${ecosystem}" "${pkg}" "${version}" 2>/dev/null); then
+    if [[ "$(jq -r '.approved' <<< "${ledger_check}")" == "true" ]]; then
+      local hash approved_at expires_at
+      hash=$(jq -r '.hash' <<< "${ledger_check}")
+      approved_at=$(jq -r '.spec.approved_at // "n/a"' <<< "${ledger_check}")
+      expires_at=$(jq -r '.spec.expires_at // "n/a"' <<< "${ledger_check}")
+      sf_ok "${pkg}@${version} 이미 승인됨 (until ${expires_at})"
+      sf_info "ledger: ${hash}"
+      if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+        jq -nc \
+          --arg ecosystem "${ecosystem}" \
+          --arg package "${pkg}" \
+          --arg range "${range}" \
+          --arg version "${version}" \
+          --arg hash "${hash}" \
+          --arg approved_at "${approved_at}" \
+          --arg expires_at "${expires_at}" \
+          '{command:"check", ecosystem:$ecosystem, package:$package, input_range:$range, resolved_version:$version, result:"already_approved", approved:true, spec_hash:$hash, approved_at:$approved_at, expires_at:$expires_at}'
+      fi
+      sf_advisory_log "check approve(cache) ecosystem=${ecosystem} package=${pkg} version=${version} hash=${hash}"
+      return 0
+    fi
+  fi
+
+  # Provider query (canonical truth = OSV; KEV overlay; GHSA enrichment)
+  local provider_json
+  sf_spinner_start "취약점 조회 중 (OSV / KEV / GHSA)"
+  if ! provider_json=$(safedeps_providers_query "${ecosystem}" "${pkg}" "${version}"); then
+    sf_spinner_stop
+    sf_err "OSV primary 응답 없음 — fail-closed (cache miss + 라이브 실패)"
+    sf_advisory_log "check fail-closed ecosystem=${ecosystem} package=${pkg} version=${version}"
+    if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+      jq -nc \
+        --arg ecosystem "${ecosystem}" --arg package "${pkg}" \
+        --arg range "${range}" --arg version "${version}" \
+        '{command:"check", ecosystem:$ecosystem, package:$package, input_range:$range, resolved_version:$version, result:"provider_unavailable", approved:false, error:"OSV primary unavailable; no fresh cache"}'
+    fi
+    return 4
+  fi
+  sf_spinner_stop
+
+  local tmp_evidence
+  tmp_evidence=$(mktemp "${TMPDIR:-/tmp}/safedeps-evidence.XXXXXX.json")
+  printf '%s' "${provider_json}" > "${tmp_evidence}"
+
+  local status vuln_count kev_exploited
+  status=$(jq -r '.status' <<< "${provider_json}")
+  vuln_count=$(jq -r '(.vulnerabilities // []) | length' <<< "${provider_json}")
+  kev_exploited=$(jq -r '.kev.exploited // false' <<< "${provider_json}")
+
+  case "${status}" in
+    hard_block)
+      sf_err "KEV 매칭 — ${pkg}@${version} 은 실제 야생에서 exploit 확인됨. 설치 차단."
+      local kev_cves
+      kev_cves=$(jq -r '[.kev.matches[]?.cveID] | unique | join(", ")' <<< "${provider_json}")
+      [[ -n "${kev_cves}" ]] && sf_info "관련 CVE: ${kev_cves}"
+      sf_warn "대체 모듈을 검토하세요. 이 spec 은 ledger 에 승인되지 않습니다."
+      sf_advisory_log "check block(KEV) ecosystem=${ecosystem} package=${pkg} version=${version} cves=${kev_cves}"
+      if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+        jq -c \
+          --arg result "kev_hard_block" \
+          --arg ecosystem "${ecosystem}" --arg package "${pkg}" \
+          --arg range "${range}" --arg version "${version}" \
+          '. + {command:"check", ecosystem:$ecosystem, package:$package, input_range:$range, resolved_version:$version, result:$result, approved:false}' <<< "${provider_json}"
+      fi
+      rm -f "${tmp_evidence}"
+      return 3
+      ;;
+
+    vulnerable)
+      local patched_version=""
+      if patched_version=$(sf_extract_patched_version "${tmp_evidence}" "${version}"); then
+        sf_warn "${pkg}@${version} 에 ${vuln_count} 개 CVE — 안전 버전 ${patched_version} 으로 좁혀 재조회합니다."
+        # narrow + recurse via providers (sub-call, no ledger short-circuit yet)
+        local narrow_json
+        sf_spinner_start "${patched_version} 재조회 중"
+        if ! narrow_json=$(safedeps_providers_query "${ecosystem}" "${pkg}" "${patched_version}"); then
+          sf_spinner_stop
+          sf_err "${pkg}@${patched_version} 재조회 실패 — fail-closed"
+          rm -f "${tmp_evidence}"
+          if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+            jq -nc \
+              --arg ecosystem "${ecosystem}" --arg package "${pkg}" \
+              --arg range "${range}" --arg version "${version}" \
+              --arg patched "${patched_version}" \
+              '{command:"check", ecosystem:$ecosystem, package:$package, input_range:$range, resolved_version:$version, suggested_spec:$patched, result:"provider_unavailable", approved:false}'
+          fi
+          return 4
+        fi
+        sf_spinner_stop
+
+        local narrow_status
+        narrow_status=$(jq -r '.status' <<< "${narrow_json}")
+        if [[ "${narrow_status}" == "clean" ]]; then
+          # approve patched version
+          local narrow_evidence
+          narrow_evidence=$(mktemp "${TMPDIR:-/tmp}/safedeps-evidence.XXXXXX.json")
+          printf '%s' "${narrow_json}" > "${narrow_evidence}"
+          local narrow_range="${patched_version}"
+          local spec_json
+          spec_json=$(safedeps_ledger_write_approved_spec "${ecosystem}" "${pkg}" "${patched_version}" "${narrow_range}" "safedeps-cli" "${narrow_evidence}")
+          rm -f "${narrow_evidence}" "${tmp_evidence}"
+          local hash; hash=$(jq -r '.hash' <<< "${spec_json}")
+          local expires_at; expires_at=$(jq -r '.expires_at' <<< "${spec_json}")
+          sf_ok "${pkg}@${patched_version} 승인 (until ${expires_at})"
+          sf_info "ledger: ${hash}"
+          sf_advisory_log "check approve(patched) ecosystem=${ecosystem} package=${pkg} version=${patched_version} hash=${hash} prev_version=${version}"
+          if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+            jq -nc \
+              --arg ecosystem "${ecosystem}" --arg package "${pkg}" \
+              --arg range "${range}" --arg version "${version}" \
+              --arg patched "${patched_version}" \
+              --arg hash "${hash}" --arg expires_at "${expires_at}" \
+              '{command:"check", ecosystem:$ecosystem, package:$package, input_range:$range, resolved_version:$version, suggested_spec:$patched, result:"patched_available", approved:true, spec_hash:$hash, expires_at:$expires_at, install_hint:("install with " + $package + "@" + $patched)}'
+          fi
+          return 0
+        else
+          sf_err "패치 버전 ${patched_version} 도 깨끗하지 않음 (status=${narrow_status})"
+          rm -f "${tmp_evidence}"
+          if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+            jq -nc \
+              --arg ecosystem "${ecosystem}" --arg package "${pkg}" \
+              --arg range "${range}" --arg version "${version}" \
+              --arg patched "${patched_version}" --arg status "${narrow_status}" \
+              '{command:"check", ecosystem:$ecosystem, package:$package, input_range:$range, resolved_version:$version, suggested_spec:$patched, result:"patched_still_vulnerable", approved:false, patched_status:$status}'
+          fi
+          return 2
+        fi
+      else
+        sf_warn "${pkg}@${version} 에 ${vuln_count} 개 CVE — 사용 가능한 patch 없음. 승인 보류."
+        sf_advisory_log "check warn(no-patch) ecosystem=${ecosystem} package=${pkg} version=${version} vulns=${vuln_count}"
+        rm -f "${tmp_evidence}"
+        if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+          jq -c \
+            --arg ecosystem "${ecosystem}" --arg package "${pkg}" \
+            --arg range "${range}" --arg version "${version}" \
+            '. + {command:"check", ecosystem:$ecosystem, package:$package, input_range:$range, resolved_version:$version, result:"cve_unpatched", approved:false}' <<< "${provider_json}"
+        fi
+        return 2
+      fi
+      ;;
+
+    clean)
+      local spec_json
+      spec_json=$(safedeps_ledger_write_approved_spec "${ecosystem}" "${pkg}" "${version}" "${range:-${version}}" "safedeps-cli" "${tmp_evidence}")
+      rm -f "${tmp_evidence}"
+      local hash; hash=$(jq -r '.hash' <<< "${spec_json}")
+      local expires_at; expires_at=$(jq -r '.expires_at' <<< "${spec_json}")
+      sf_ok "${pkg}@${version} 승인 (until ${expires_at})"
+      sf_info "ledger: ${hash}"
+      sf_advisory_log "check approve(clean) ecosystem=${ecosystem} package=${pkg} version=${version} hash=${hash}"
+      if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+        jq -nc \
+          --arg ecosystem "${ecosystem}" --arg package "${pkg}" \
+          --arg range "${range}" --arg version "${version}" \
+          --arg hash "${hash}" --arg expires_at "${expires_at}" \
+          '{command:"check", ecosystem:$ecosystem, package:$package, input_range:$range, resolved_version:$version, result:"clean", approved:true, spec_hash:$hash, expires_at:$expires_at, install_hint:("install with " + $package + "@" + $version)}'
+      fi
+      return 0
+      ;;
+
+    *)
+      sf_err "예상치 못한 provider status: ${status}"
+      rm -f "${tmp_evidence}"
+      return 4
+      ;;
+  esac
+}
+
+# ---- ledger ------------------------------------------------------------------
+
+cmd_ledger() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) cmd_help ledger; return 0 ;;
+      *) sf_eprintf "safedeps: unexpected arg for ledger: $1"; return 4 ;;
+    esac
+  done
+
+  sf_require_jq
+  safedeps_ledger_init
+
+  local entries=()
+  if [[ -d "${SAFEDEPS_LEDGER_DIR}" ]]; then
+    while IFS= read -r -d '' f; do
+      entries+=("${f}")
+    done < <(find "${SAFEDEPS_LEDGER_DIR}" -maxdepth 1 -name '*.json' -type f -print0 2>/dev/null)
+  fi
+
+  if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+    local merged='[]'
+    for f in "${entries[@]+${entries[@]}}"; do
+      local now_iso
+      now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      merged=$(jq -c --slurpfile spec "${f}" --arg now "${now_iso}" '
+        . + [
+          ($spec[0]) as $s |
+          {
+            hash: $s.hash,
+            ecosystem: $s.ecosystem,
+            package: $s.package,
+            version: $s.version,
+            version_range: $s.version_range,
+            approved_at: $s.approved_at,
+            expires_at: $s.expires_at,
+            approved_by: $s.approved_by,
+            expired: ($s.expires_at < $now),
+            revoked: (($s.revoked_at // null) != null)
+          }
+        ]
+      ' <<< "${merged}")
+    done
+    jq -nc --argjson specs "${merged}" '{command:"ledger", count: ($specs | length), specs: $specs}'
+    return 0
+  fi
+
+  if [[ ${#entries[@]} -eq 0 ]]; then
+    sf_info "approved-specs 비어있음 (${SAFEDEPS_LEDGER_DIR})"
+    return 0
+  fi
+
+  printf '%s%-8s %-12s %-40s %-14s %-22s %-22s %s%s\n' \
+    "${C_BOLD}" "STATE" "ECOSYSTEM" "PACKAGE" "VERSION" "APPROVED" "EXPIRES" "HASH" "${C_RESET}"
+  for f in "${entries[@]+${entries[@]}}"; do
+    local hash ecosystem pkg version approved_at expires_at revoked_at expired state state_color
+    hash=$(jq -r '.hash // ""' "${f}")
+    ecosystem=$(jq -r '.ecosystem // ""' "${f}")
+    pkg=$(jq -r '.package // ""' "${f}")
+    version=$(jq -r '.version // ""' "${f}")
+    approved_at=$(jq -r '.approved_at // ""' "${f}")
+    expires_at=$(jq -r '.expires_at // ""' "${f}")
+    revoked_at=$(jq -r '.revoked_at // ""' "${f}")
+
+    expired=0
+    if [[ -n "${expires_at}" ]]; then
+      local exp_epoch now_epoch
+      if exp_epoch=$(safedeps_ledger_epoch "${expires_at}" 2>/dev/null); then
+        now_epoch=$(date +%s)
+        [[ "${exp_epoch}" -le "${now_epoch}" ]] && expired=1
+      fi
+    fi
+
+    if [[ -n "${revoked_at}" ]]; then
+      state="REVOKED"; state_color="${C_GRAY}"
+    elif [[ "${expired}" -eq 1 ]]; then
+      state="EXPIRED"; state_color="${C_YELLOW}"
+    else
+      state="ACTIVE";  state_color="${C_GREEN}"
+    fi
+
+    printf '%s%-8s%s %-12s %-40s %-14s %-22s %-22s %s\n' \
+      "${state_color}" "${state}" "${C_RESET}" \
+      "${ecosystem}" "${pkg}" "${version}" \
+      "${approved_at}" "${expires_at}" "${hash}"
+  done
+}
+
+# ---- revoke ------------------------------------------------------------------
+
+cmd_revoke() {
+  local arg1="" arg2="" reason=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) cmd_help revoke; return 0 ;;
+      --reason) reason="${2:-}"; shift 2; continue ;;
+      --reason=*) reason="${1#--reason=}"; shift; continue ;;
+      -*) sf_eprintf "safedeps: unknown option for revoke: $1"; return 4 ;;
+      *)
+        if [[ -z "${arg1}" ]]; then arg1="$1"
+        elif [[ -z "${arg2}" ]]; then arg2="$1"
+        else sf_eprintf "safedeps: unexpected arg: $1"; return 4
+        fi
+        shift; continue
+        ;;
+    esac
+    shift
+  done
+
+  if [[ -z "${arg1}" ]]; then
+    sf_eprintf "usage: safedeps revoke <hash> | <ecosystem> <pkg>@<version> | <pkg>@<version>  [--reason <reason>]"
+    return 4
+  fi
+
+  sf_require_jq
+  safedeps_ledger_init
+  reason="${reason:-cli-revoke}"
+
+  local target_file=""
+  if [[ "${arg1}" == sha256:* ]]; then
+    target_file=$(safedeps_ledger_path_for_hash "${arg1}")
+    [[ -f "${target_file}" ]] || { sf_err "ledger entry 없음: ${arg1}"; return 1; }
+  else
+    # one or two args. Two = ecosystem + pkg@version. One = pkg@version (scan).
+    if [[ -n "${arg2}" ]]; then
+      local pkg version
+      pkg=$(sf_parse_pkg_spec "${arg2}" | sed -n '1p')
+      version=$(sf_parse_pkg_spec "${arg2}" | sed -n '2p')
+      [[ -n "${version}" ]] || { sf_eprintf "safedeps: revoke needs pkg@version, got '${arg2}'"; return 4; }
+      target_file=$(safedeps_ledger_path "${arg1}" "${pkg}" "${version}")
+      [[ -f "${target_file}" ]] || { sf_err "ledger entry 없음: ${arg1} ${pkg}@${version}"; return 1; }
+    else
+      local pkg version
+      pkg=$(sf_parse_pkg_spec "${arg1}" | sed -n '1p')
+      version=$(sf_parse_pkg_spec "${arg1}" | sed -n '2p')
+      [[ -n "${version}" ]] || { sf_eprintf "safedeps: revoke needs pkg@version or hash, got '${arg1}'"; return 4; }
+      local matches=()
+      while IFS= read -r -d '' f; do
+        local p v
+        p=$(jq -r '.package // ""' "${f}")
+        v=$(jq -r '.version // ""' "${f}")
+        if [[ "${p}" == "${pkg}" && "${v}" == "${version}" ]]; then
+          matches+=("${f}")
+        fi
+      done < <(find "${SAFEDEPS_LEDGER_DIR}" -maxdepth 1 -name '*.json' -type f -print0 2>/dev/null)
+      case "${#matches[@]}" in
+        0) sf_err "ledger entry 없음: ${pkg}@${version}"; return 1 ;;
+        1) target_file="${matches[0]}" ;;
+        *) sf_err "${pkg}@${version} 가 여러 ecosystem 에서 매칭됨 — ecosystem 을 명시하세요"; return 4 ;;
+      esac
+    fi
+  fi
+
+  local ecosystem pkg version
+  ecosystem=$(jq -r '.ecosystem' "${target_file}")
+  pkg=$(jq -r '.package' "${target_file}")
+  version=$(jq -r '.version' "${target_file}")
+
+  local revoked_json
+  revoked_json=$(safedeps_ledger_revoke "${ecosystem}" "${pkg}" "${version}" "${reason}")
+  sf_advisory_log "revoke ecosystem=${ecosystem} package=${pkg} version=${version} reason=${reason}"
+  sf_ok "취소: ${ecosystem} ${pkg}@${version}"
+  sf_info "reason: ${reason}"
+
+  if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+    jq -c --arg reason "${reason}" \
+      '{command:"revoke", revoked:true, reason:$reason, spec: .}' <<< "${revoked_json}"
+  fi
+}
+
+# ---- re-check ----------------------------------------------------------------
+
+cmd_recheck() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) cmd_help re-check; return 0 ;;
+      *) sf_eprintf "safedeps: unexpected arg for re-check: $1"; return 4 ;;
+    esac
+  done
+
+  sf_require_jq
+  safedeps_ledger_init
+
+  local entries=()
+  while IFS= read -r -d '' f; do
+    entries+=("${f}")
+  done < <(find "${SAFEDEPS_LEDGER_DIR}" -maxdepth 1 -name '*.json' -type f -print0 2>/dev/null)
+
+  local checked=0 still_clean=0
+  local newly_vuln_arr='[]' kev_hit_arr='[]' revoked_arr='[]'
+
+  for f in "${entries[@]+${entries[@]}}"; do
+    local ecosystem pkg version revoked_at
+    ecosystem=$(jq -r '.ecosystem' "${f}")
+    pkg=$(jq -r '.package' "${f}")
+    version=$(jq -r '.version' "${f}")
+    revoked_at=$(jq -r '.revoked_at // ""' "${f}")
+    [[ -n "${revoked_at}" ]] && continue
+    checked=$(( checked + 1 ))
+
+    sf_info "재검증 ${ecosystem} ${pkg}@${version}"
+    local pj
+    if ! pj=$(safedeps_providers_query "${ecosystem}" "${pkg}" "${version}" 2>/dev/null); then
+      sf_warn "  provider 응답 없음 — skip"
+      continue
+    fi
+    local s; s=$(jq -r '.status' <<< "${pj}")
+    case "${s}" in
+      clean)
+        still_clean=$(( still_clean + 1 ))
+        ;;
+      vulnerable|hard_block)
+        local reason="re-check ${s}"
+        safedeps_ledger_revoke "${ecosystem}" "${pkg}" "${version}" "${reason}" >/dev/null
+        sf_advisory_log "re-check revoke ecosystem=${ecosystem} package=${pkg} version=${version} status=${s}"
+        if [[ "${s}" == "hard_block" ]]; then
+          sf_err "  KEV 매칭 → revoke"
+          kev_hit_arr=$(jq -c \
+            --arg ecosystem "${ecosystem}" --arg package "${pkg}" --arg version "${version}" \
+            '. + [{ecosystem:$ecosystem, package:$package, version:$version, status:"hard_block"}]' <<< "${kev_hit_arr}")
+        else
+          sf_warn "  새 CVE 매치 → revoke"
+          newly_vuln_arr=$(jq -c \
+            --arg ecosystem "${ecosystem}" --arg package "${pkg}" --arg version "${version}" \
+            '. + [{ecosystem:$ecosystem, package:$package, version:$version, status:"vulnerable"}]' <<< "${newly_vuln_arr}")
+        fi
+        revoked_arr=$(jq -c \
+          --arg ecosystem "${ecosystem}" --arg package "${pkg}" --arg version "${version}" --arg reason "${reason}" \
+          '. + [{ecosystem:$ecosystem, package:$package, version:$version, reason:$reason}]' <<< "${revoked_arr}")
+        ;;
+    esac
+  done
+
+  if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+    jq -nc \
+      --argjson newly_vulnerable "${newly_vuln_arr}" \
+      --argjson kev_hit "${kev_hit_arr}" \
+      --argjson revoked "${revoked_arr}" \
+      --argjson checked "${checked}" \
+      --argjson still_clean "${still_clean}" \
+      '{command:"re-check", checked:$checked, still_clean:$still_clean, newly_vulnerable:$newly_vulnerable, kev_hit:$kev_hit, revoked:$revoked}'
+    return 0
+  fi
+
+  sf_info "검증 완료: ${checked} 개 중 ${still_clean} 개 clean"
+  local nv kv
+  nv=$(jq -r 'length' <<< "${newly_vuln_arr}")
+  kv=$(jq -r 'length' <<< "${kev_hit_arr}")
+  [[ "${nv}" -gt 0 ]] && sf_warn "새 CVE 매치로 ${nv} 개 revoke"
+  [[ "${kv}" -gt 0 ]] && sf_err  "KEV 매치로 ${kv} 개 revoke"
+}
+
+# ---- help / version ----------------------------------------------------------
+
+cmd_version() {
+  if [[ "${SAFEDEPS_JSON_MODE}" -eq 1 ]]; then
+    jq -nc --arg v "${SAFEDEPS_VERSION}" '{command:"version", version:$v}'
+  else
+    printf 'safedeps %s\n' "${SAFEDEPS_VERSION}"
+  fi
+}
+
+cmd_help() {
+  local topic="${1:-}"
+  case "${topic}" in
+    check)
+      cat <<'EOF'
+safedeps check <ecosystem> <pkg>@<version|range> [--json]
+
+  Phase 1 advisory gate. Query OSV (canonical) + CISA KEV (overlay) + GHSA (enrichment),
+  classify, and — when clean or patched_available — write an approved-spec entry.
+
+  ecosystem: npm | pypi | crates.io | go | rubygems | maven | nuget
+  exit codes: 0 clean/approved · 1 reserved · 2 cve_unpatched · 3 kev_hard_block · 4 input/provider error
+EOF
+      ;;
+    ledger)
+      cat <<'EOF'
+safedeps ledger [--json]
+
+  List approved specs from ~/.safedeps/approved-specs/.
+  Columns: STATE ECOSYSTEM PACKAGE VERSION APPROVED EXPIRES HASH.
+EOF
+      ;;
+    revoke)
+      cat <<'EOF'
+safedeps revoke <hash> | <ecosystem> <pkg>@<version> | <pkg>@<version> [--reason <reason>] [--json]
+
+  Mark an approved-spec entry as revoked. The hook will then block install
+  commands for that spec until it is re-approved with `safedeps check`.
+EOF
+      ;;
+    re-check)
+      cat <<'EOF'
+safedeps re-check [--json]
+
+  Re-query providers for every active approved spec.
+  Auto-revoke entries that newly match a CVE or KEV.
+EOF
+      ;;
+    *)
+      cat <<EOF
+safedeps ${SAFEDEPS_VERSION} — multi-ecosystem install safety gate
+
+USAGE
+  safedeps <command> [args] [--json] [--no-color]
+
+COMMANDS
+  check <ecosystem> <pkg>@<version|range>   Phase 1 advisory gate + ledger approve.
+  ledger                                    List approved specs.
+  revoke <hash | pkg@version>               Revoke an approved spec.
+  re-check                                  Re-query providers for all approved specs.
+  help [command]                            Show help.
+  version                                   Print version.
+
+GLOBAL FLAGS
+  --json       Machine-readable JSON output (stable schema).
+  --no-color   Disable ANSI colors.
+
+EXIT CODES
+  0  clean / approved
+  2  CVE found without an upgrade path
+  3  CISA KEV match — hard block
+  4  input error or provider unavailable (fail-closed)
+
+ENV
+  SAFEDEPS_HOME           default ~/.safedeps
+  SAFEDEPS_LEDGER_DIR     default \$SAFEDEPS_HOME/approved-specs
+  GITHUB_TOKEN            optional, used for GHSA enrichment
+EOF
+      ;;
+  esac
+}
+
+# ---- main dispatch -----------------------------------------------------------
+
+main() {
+  local positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) SAFEDEPS_JSON_MODE=1; shift ;;
+      --no-color) SAFEDEPS_NO_COLOR=1; shift ;;
+      -h|--help)
+        positional+=("help")
+        shift
+        ;;
+      --version)
+        positional+=("version")
+        shift
+        ;;
+      --) shift; while [[ $# -gt 0 ]]; do positional+=("$1"); shift; done ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+
+  sf_color_init
+
+  if [[ ${#positional[@]} -eq 0 ]]; then
+    cmd_help
+    return 0
+  fi
+
+  local cmd="${positional[0]}"
+  set -- "${positional[@]:1}"
+
+  case "${cmd}" in
+    check)    cmd_check    "$@" ;;
+    ledger)   cmd_ledger   "$@" ;;
+    revoke)   cmd_revoke   "$@" ;;
+    re-check|recheck) cmd_recheck "$@" ;;
+    help)     cmd_help     "$@" ;;
+    version)  cmd_version ;;
+    *)
+      sf_eprintf "safedeps: unknown command '${cmd}'. Try 'safedeps help'."
+      return 4
+      ;;
+  esac
+}
+
+main "$@"

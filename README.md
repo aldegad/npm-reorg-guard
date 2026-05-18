@@ -1,16 +1,16 @@
-# npm-reorg-guard
+# Safedeps
 
-> Blockchain reorg meets npm security -- snapshot, verify, and auto-rollback suspicious package installs in Claude Code.
+> Dependency install safety gate -- advisory checks, approved spec enforcement, and auto-rollback suspicious package installs in Claude Code.
 
 ## Why "reorg"?
 
-In blockchain networks, a **reorganization (reorg)** invalidates a sequence of blocks and reverts the chain to a previously confirmed safe state. `npm-reorg-guard` applies the same principle to your `node_modules`: every `npm install` is treated as an unconfirmed block candidate until it passes a battery of supply-chain security checks. If anything looks wrong, the tool performs a **reorg** -- rolling back lock files, `package.json`, and `node_modules` to the last confirmed safe snapshot.
+In blockchain networks, a **reorganization (reorg)** invalidates a sequence of blocks and reverts the chain to a previously confirmed safe state. `safedeps` applies the same principle to your `node_modules`: every install is treated as an unconfirmed block candidate until it passes a battery of supply-chain security checks. If anything looks wrong, the tool performs a **reorg** -- rolling back lock files, `package.json`, and `node_modules` to the last confirmed safe snapshot.
 
 No manual review. No leftover malicious code. Fully automatic.
 
 ## How It Works
 
-`npm-reorg-guard` plugs into [Claude Code's hook system](https://docs.anthropic.com/en/docs/claude-code/hooks) as a pair of **PreToolUse** and **PostToolUse** hooks that wrap every package install command.
+`safedeps` plugs into [Claude Code's hook system](https://docs.anthropic.com/en/docs/claude-code/hooks) as a pair of **PreToolUse** and **PostToolUse** hooks that wrap every package install command.
 
 ```
                          PreToolUse                          PostToolUse
@@ -33,7 +33,7 @@ No manual review. No leftover malicious code. Fully automatic.
 
 When Claude Code is about to run `npm install`, `pnpm add`, `yarn add`, or similar commands, the guard hook:
 
-1. **Snapshots** the current `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, and `package.json` into `~/.npm-reorg-guard/snapshots/`.
+1. **Snapshots** the current `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, and `package.json` into `~/.safedeps/snapshots/`.
 2. **Records metadata** including a `parent_snapshot_id` linking to the previous confirmed snapshot (forming a chain, just like blocks).
 3. **Captures pre-install state** of `node_modules` (package listings and binary listings) for diff-based detection later.
 4. **Runs pre-flight checks** and **blocks** the command entirely if it detects:
@@ -63,21 +63,21 @@ After the install command completes, the verify hook analyzes what changed:
 
 ### Phase 3: Confirm or Reorg
 
-- **All checks pass** -- The snapshot is marked as **confirmed** in `~/.npm-reorg-guard/confirmed`. This becomes the new safe baseline.
+- **All checks pass** -- The snapshot is marked as **confirmed** in `~/.safedeps/confirmed`. This becomes the new safe baseline.
 - **Any check fails** -- A **reorg** is triggered:
   1. Lock files are restored from the last confirmed snapshot.
   2. `package.json` is restored if it was modified.
   3. `node_modules` is rebuilt via `npm ci` (or `npm install` as fallback) to purge any malicious artifacts.
-  4. The event is logged to `~/.npm-reorg-guard/reorg.log`.
+  4. The event is logged to `~/.safedeps/reorg.log`.
   5. Claude Code receives a system message detailing the detected threats and rollback actions.
 
 ## The Blockchain Analogy
 
-| Blockchain Concept | npm-reorg-guard Equivalent |
+| Blockchain Concept | Safedeps Equivalent |
 |---|---|
 | **Block candidate** | Snapshot taken before `npm install` |
 | **Block validation** | Post-install security checks (scripts, lock diff, binaries) |
-| **Finality / confirmation** | Snapshot ID written to `~/.npm-reorg-guard/confirmed` |
+| **Finality / confirmation** | Snapshot ID written to `~/.safedeps/confirmed` |
 | **Chain reorganization** | Rollback to last confirmed snapshot + `node_modules` rebuild |
 | **Parent hash linking** | `parent_snapshot_id` in each snapshot's `_meta.json` |
 | **Chain pruning** | Old unconfirmed snapshots cleaned up, confirmed chain preserved |
@@ -121,8 +121,8 @@ sudo apt-get install jq
 **1. Clone the repository:**
 
 ```bash
-git clone https://github.com/soohongkim/npm-reorg-guard.git
-cp -r npm-reorg-guard ~/.claude/skills/
+git clone https://github.com/aldegad/safedeps.git
+cp -r safedeps ~/.claude/skills/
 ```
 
 **2. Add hooks to your Claude Code settings:**
@@ -138,7 +138,7 @@ Edit `.claude/settings.json` (project-level) or `~/.claude/settings.json` (globa
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/skills/npm-reorg-guard/scripts/guard.sh"
+            "command": "~/.claude/skills/safedeps/scripts/safedeps-pre-guard.sh"
           }
         ]
       }
@@ -149,7 +149,7 @@ Edit `.claude/settings.json` (project-level) or `~/.claude/settings.json` (globa
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/skills/npm-reorg-guard/scripts/verify.sh"
+            "command": "~/.claude/skills/safedeps/scripts/safedeps-post-verify.sh"
           }
         ]
       }
@@ -161,15 +161,15 @@ Edit `.claude/settings.json` (project-level) or `~/.claude/settings.json` (globa
 **3. Verify permissions:**
 
 ```bash
-chmod +x ~/.claude/skills/npm-reorg-guard/scripts/guard.sh
-chmod +x ~/.claude/skills/npm-reorg-guard/scripts/verify.sh
+chmod +x ~/.claude/skills/safedeps/scripts/safedeps-pre-guard.sh
+chmod +x ~/.claude/skills/safedeps/scripts/safedeps-post-verify.sh
 ```
 
 That's it. The guard activates automatically whenever Claude Code runs a package install command.
 
 ## Real-World Attack Coverage
 
-`npm-reorg-guard` is designed to catch the patterns behind real supply-chain incidents:
+`safedeps` is designed to catch the patterns behind real supply-chain incidents:
 
 - **`event-stream` (2018)** -- Malicious `postinstall` script with obfuscated code that exfiltrated cryptocurrency wallet keys. Caught by: install script analysis (obfuscation + network access detection).
 - **`ua-parser-js` hijack (2021)** -- Compromised package added a `preinstall` script that downloaded and executed cryptominers. Caught by: install script analysis (network access + code execution).
@@ -181,26 +181,26 @@ That's it. The guard activates automatically whenever Claude Code runs a package
 
 | Path | Description |
 |---|---|
-| `~/.npm-reorg-guard/reorg.log` | Full reorg event history with timestamps, reasons, and rolled-back files |
-| `~/.npm-reorg-guard/confirmed` | Current confirmed (safe) snapshot ID |
-| `~/.npm-reorg-guard/snapshots/` | All snapshot files (lock files, package.json copies, metadata) |
+| `~/.safedeps/reorg.log` | Full reorg event history with timestamps, reasons, and rolled-back files |
+| `~/.safedeps/confirmed` | Current confirmed (safe) snapshot ID |
+| `~/.safedeps/snapshots/` | All snapshot files (lock files, package.json copies, metadata) |
 
 ```bash
 # View reorg history
-cat ~/.npm-reorg-guard/reorg.log
+cat ~/.safedeps/reorg.log
 
 # Check current confirmed snapshot
-cat ~/.npm-reorg-guard/confirmed
+cat ~/.safedeps/confirmed
 
 # List all snapshots
-ls -la ~/.npm-reorg-guard/snapshots/
+ls -la ~/.safedeps/snapshots/
 ```
 
 Old unconfirmed snapshots are automatically pruned (keeping the 10 most recent), while the confirmed snapshot chain is always preserved.
 
 ## Security Hardening
 
-`npm-reorg-guard` includes multiple layers of defense against attacks targeting the guard itself:
+`safedeps` includes multiple layers of defense against attacks targeting the guard itself:
 
 | Measure | What it prevents |
 |---|---|
@@ -209,13 +209,13 @@ Old unconfirmed snapshots are automatically pruned (keeping the 10 most recent),
 | **Atomic state files** | Snapshot ID and project directory are written as a single JSON file, preventing TOCTOU races |
 | **Stale lock recovery** | Locks older than 60 seconds are automatically removed, preventing permanent DoS from `SIGKILL`/OOM |
 | **Project-scoped state** | Each project gets its own confirmed snapshot chain (`confirmed_${dir_hash}`), preventing cross-project interference |
-| **Restrictive permissions** | `umask 077` ensures `~/.npm-reorg-guard/` is readable only by the owner |
+| **Restrictive permissions** | `umask 077` ensures `~/.safedeps/` is readable only by the owner |
 | **Indirection detection** | Commands using `eval`, `$()`, or backticks with package manager keywords are treated as install candidates |
 
 ## Project Structure
 
 ```
-npm-reorg-guard/
+safedeps/
   scripts/
     guard.sh      # PreToolUse hook -- snapshot + pre-flight checks
     verify.sh     # PostToolUse hook -- post-install verification + reorg

@@ -1,4 +1,4 @@
 interface:
-  display_name: "NPM Reorg Guard"
-  short_description: "Opt-in npm install supply-chain guard hooks."
-  default_prompt: "Install or review the npm reorg guard hooks for package install safety."
+  display_name: "Safedeps"
+  short_description: "Opt-in dependency install safety gate and reorg rollback hooks."
+  default_prompt: "Install or review the Safedeps hooks and approved-spec ledger for package install safety."

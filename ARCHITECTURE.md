@@ -473,11 +473,11 @@ install 완료 → verify.sh
 │  bin/safedeps         — CLI entry (advisory check, ledger 관리,        │
 │                         재검증 등).                                    │
 ├─────────────────────────────────────────────────────────────────────┤
-│  scripts/guard.sh     — PreToolUse hook. ledger 일치 검증 + v1 의      │
-│                         hardcoded pattern.                            │
+│  scripts/safedeps-pre-guard.sh — PreToolUse hook. ledger 일치 검증     │
+│                         + v1 의 hardcoded pattern.                    │
 ├─────────────────────────────────────────────────────────────────────┤
-│  scripts/verify.sh    — PostToolUse hook. lockfile diff + spec 비교    │
-│                         + reorg.                                      │
+│  scripts/safedeps-post-verify.sh — PostToolUse hook. lockfile diff +  │
+│                         spec 비교 + reorg.                             │
 ├─────────────────────────────────────────────────────────────────────┤
 │  lib/providers/       — OSV / KEV / GHSA / NVD / deps.dev / Snyk      │
 │                         adapter. 하나의 query interface.               │
@@ -543,15 +543,17 @@ v1 (npm-reorg-guard)                v2 (safedeps)
 ~/.npm-reorg-guard/        →        ~/.safedeps/
 ~/.claude/skills/                   ~/.claude/skills/
   npm-reorg-guard/         →          safedeps/
-                                      (symlink 호환 유지: npm-reorg-guard → safedeps)
+                                      (old local skill path is not canonical)
 
-scripts/guard.sh           →        scripts/guard.sh
+scripts/guard.sh           →        scripts/safedeps-pre-guard.sh
   (typosquat / pattern               + ledger lookup
    매칭만)                            + v1 pattern 유지
+                                      + namespaced filename
 
-scripts/verify.sh          →        scripts/verify.sh
+scripts/verify.sh          →        scripts/safedeps-post-verify.sh
   (lockfile diff + reorg)            + approved spec diff
                                       + v1 reorg 유지
+                                      + namespaced filename
 
 (없음)                     →        bin/safedeps  ← 새 CLI
                                       check / approve / revoke /
@@ -562,12 +564,12 @@ scripts/verify.sh          →        scripts/verify.sh
 
 GitHub repo:
   aldegad/npm-reorg-guard  →        aldegad/safedeps
-                                      (old name redirect 유지)
+                                      (GitHub redirect only)
 ```
 
-v1 호환:
-- v1 hook 등록 path (`~/.claude/skills/npm-reorg-guard/scripts/*.sh`) 그대로 작동하는 symlink 유지.
-- v1 의 `~/.npm-reorg-guard/` 디렉토리 발견 시 자동 `~/.safedeps/` 으로 마이그레이션 (snapshot chain 보존).
+v1 migration:
+- v1 hook 등록 path (`~/.claude/skills/npm-reorg-guard/scripts/*.sh`) 는 canonical 이 아니다. settings 는 `~/.claude/skills/safedeps/scripts/*.sh` 로 갱신한다.
+- v1 의 `~/.npm-reorg-guard/` 디렉토리 발견 시 `~/.safedeps/` 으로 마이그레이션한다 (snapshot chain 보존).
 - v1 사용자는 `safedeps migrate` 한 줄로 ledger 신규 생성 + 기존 confirmed snapshot 들을 그대로 approved spec 으로 변환.
 
 ---
