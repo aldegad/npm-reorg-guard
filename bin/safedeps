@@ -715,6 +715,18 @@ cmd_gates() {
   exec bash "${script}" "$@"
 }
 
+cmd_scan() {
+  exec bash "${SAFEDEPS_REPO_DIR}/lib/gates/scan.sh" "$@"
+}
+
+cmd_audit() {
+  exec bash "${SAFEDEPS_REPO_DIR}/lib/gates/audit.sh" "$@"
+}
+
+cmd_hooks() {
+  exec bash "${SAFEDEPS_REPO_DIR}/lib/gates/hooks.sh" "$@"
+}
+
 # ---- help / version ----------------------------------------------------------
 
 cmd_version() {
@@ -785,6 +797,9 @@ COMMANDS
   re-check                                  Re-query providers for all approved specs.
   migrate                                   Migrate legacy npm-reorg-guard state.
   gates [run]                               Release-time repo gates: secret scan, dep audit, hook/CI check.
+  scan secrets [--repo|--worktree|--staged] Run gitleaks secret scan (repo profile aware).
+  audit [npm]                               Run npm lockfile audit.
+  hooks <install|check>                     Install/verify repo-local git hooks.
   help [command]                            Show help.
   version                                   Print version.
 
@@ -845,6 +860,9 @@ main() {
     re-check|recheck) cmd_recheck "$@" ;;
     migrate)  cmd_migrate  "$@" ;;
     gates)    cmd_gates    "$@" ;;
+    scan)     cmd_scan     "$@" ;;
+    audit)    cmd_audit    "$@" ;;
+    hooks)    cmd_hooks    "$@" ;;
     help)     cmd_help     "$@" ;;
     version)  cmd_version ;;
     *)
