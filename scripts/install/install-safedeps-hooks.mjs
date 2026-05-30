@@ -11,18 +11,20 @@
 //   node scripts/install/install-safedeps-hooks.mjs --uninstall
 //   node scripts/install/install-safedeps-hooks.mjs --link-bin   (optional ~/.local/bin/safedeps)
 
-import { existsSync, lstatSync, readFileSync, writeFileSync, copyFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, writeFileSync, copyFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..");
-const HOME = homedir();
+const HOME = process.env.HOME || homedir();
 
 const SKILL_ID = "safedeps";
-const PRE_HOOK = join(REPO_ROOT, "scripts", "safedeps-pre-guard.sh");
-const POST_HOOK = join(REPO_ROOT, "scripts", "safedeps-post-verify.sh");
+const PRE_HOOK_NAME = "safedeps-pre-guard.sh";
+const POST_HOOK_NAME = "safedeps-post-verify.sh";
+const REPO_PRE_HOOK = join(REPO_ROOT, "scripts", PRE_HOOK_NAME);
+const REPO_POST_HOOK = join(REPO_ROOT, "scripts", POST_HOOK_NAME);
 const CLI_BIN = join(REPO_ROOT, "bin", "safedeps");
 
 const args = new Set(process.argv.slice(2));
@@ -71,7 +73,14 @@ function writeJsonWithBackup(path, value) {
   } else {
     mkdirSync(dirname(path), { recursive: true });
   }
-  writeFileSync(path, JSON.stringify(value, null, 2) + "\n");
+  const tmpPath = `${path}.tmp.${process.pid}.${Date.now()}`;
+  writeFileSync(tmpPath, JSON.stringify(value, null, 2) + "\n");
+  renameSync(tmpPath, path);
+}
+
+function engineHookCommand(engineRoot, hookName) {
+  const engineName = basename(engineRoot).replace(/^\./u, "");
+  return `~/.${engineName}/skills/${SKILL_ID}/scripts/${hookName}`;
 }
 
 function ensureHook(config, eventName, command) {
@@ -79,15 +88,18 @@ function ensureHook(config, eventName, command) {
   config.hooks[eventName] = config.hooks[eventName] ?? [];
   const buckets = config.hooks[eventName];
 
+  const already = buckets.some((bucket) =>
+    Array.isArray(bucket?.hooks) &&
+    bucket.hooks.some((h) => h && h.type === "command" && h.command === command),
+  );
+  if (already) return false;
+
   let bashBucket = buckets.find((b) => b && b.matcher === "Bash");
   if (!bashBucket) {
     bashBucket = { matcher: "Bash", hooks: [] };
     buckets.push(bashBucket);
   }
   bashBucket.hooks = bashBucket.hooks ?? [];
-
-  const already = bashBucket.hooks.some((h) => h && h.type === "command" && h.command === command);
-  if (already) return false;
 
   bashBucket.hooks.push({ type: "command", command });
   return true;
@@ -106,20 +118,43 @@ function removeHook(config, eventName, command) {
   return changed;
 }
 
-function pruneLegacySafedepsHooks(config, eventName) {
+function isSafedepsHookCommand(command, hookName) {
+  if (typeof command !== "string") return false;
+  const normalized = command.replace(/\\/gu, "/");
+  if (normalized.includes("npm-reorg-guard")) return true;
+  return normalized.includes("/safedeps/") && normalized.endsWith(`/scripts/${hookName}`);
+}
+
+function pruneNonCanonicalSafedepsHooks(config, eventName, canonicalCommand, hookName) {
+  const buckets = config?.hooks?.[eventName];
+  if (!Array.isArray(buckets)) return false;
+  let changed = false;
+  let seenCanonical = false;
+  for (const bucket of buckets) {
+    if (!bucket || !Array.isArray(bucket.hooks)) continue;
+    const before = bucket.hooks.length;
+    bucket.hooks = bucket.hooks.filter((h) => {
+      const command = h?.command;
+      if (command === canonicalCommand) {
+        if (seenCanonical) return false;
+        seenCanonical = true;
+        return true;
+      }
+      return command === canonicalCommand || !isSafedepsHookCommand(command, hookName);
+    });
+    if (bucket.hooks.length !== before) changed = true;
+  }
+  return changed;
+}
+
+function pruneAllSafedepsHooks(config, eventName, hookName) {
   const buckets = config?.hooks?.[eventName];
   if (!Array.isArray(buckets)) return false;
   let changed = false;
   for (const bucket of buckets) {
-    if (!bucket || bucket.matcher !== "Bash" || !Array.isArray(bucket.hooks)) continue;
+    if (!bucket || !Array.isArray(bucket.hooks)) continue;
     const before = bucket.hooks.length;
-    bucket.hooks = bucket.hooks.filter((h) => {
-      const command = h?.command;
-      if (typeof command !== "string") return true;
-      const legacySafedeps = command.includes("npm-reorg-guard") || command.includes("/safedeps/");
-      const legacyHookName = command.endsWith("/scripts/guard.sh") || command.endsWith("/scripts/verify.sh");
-      return !(legacySafedeps && legacyHookName);
-    });
+    bucket.hooks = bucket.hooks.filter((h) => !isSafedepsHookCommand(h?.command, hookName));
     if (bucket.hooks.length !== before) changed = true;
   }
   return changed;
@@ -132,13 +167,15 @@ function installInEngine({ engineRoot, configPath, label }) {
   }
   const skillsRoot = join(engineRoot, "skills");
   const skillLink = join(skillsRoot, SKILL_ID);
+  const preCommand = engineHookCommand(engineRoot, PRE_HOOK_NAME);
+  const postCommand = engineHookCommand(engineRoot, POST_HOOK_NAME);
 
   if (UNINSTALL) {
     removeSymlink(skillLink);
     if (existsSync(configPath)) {
       const cfg = readJson(configPath);
-      const pre = removeHook(cfg, "PreToolUse", PRE_HOOK);
-      const post = removeHook(cfg, "PostToolUse", POST_HOOK);
+      const pre = removeHook(cfg, "PreToolUse", preCommand) || pruneAllSafedepsHooks(cfg, "PreToolUse", PRE_HOOK_NAME);
+      const post = removeHook(cfg, "PostToolUse", postCommand) || pruneAllSafedepsHooks(cfg, "PostToolUse", POST_HOOK_NAME);
       if (pre || post) {
         writeJsonWithBackup(configPath, cfg);
         log(`patched ${configPath} (removed safedeps hooks)`);
@@ -152,10 +189,10 @@ function installInEngine({ engineRoot, configPath, label }) {
   ensureSymlink(REPO_ROOT, skillLink);
 
   const cfg = readJson(configPath);
-  const legacyPreRemoved = pruneLegacySafedepsHooks(cfg, "PreToolUse");
-  const legacyPostRemoved = pruneLegacySafedepsHooks(cfg, "PostToolUse");
-  const preAdded = ensureHook(cfg, "PreToolUse", PRE_HOOK);
-  const postAdded = ensureHook(cfg, "PostToolUse", POST_HOOK);
+  const legacyPreRemoved = pruneNonCanonicalSafedepsHooks(cfg, "PreToolUse", preCommand, PRE_HOOK_NAME);
+  const legacyPostRemoved = pruneNonCanonicalSafedepsHooks(cfg, "PostToolUse", postCommand, POST_HOOK_NAME);
+  const preAdded = ensureHook(cfg, "PreToolUse", preCommand);
+  const postAdded = ensureHook(cfg, "PostToolUse", postCommand);
   if (legacyPreRemoved || legacyPostRemoved || preAdded || postAdded) {
     writeJsonWithBackup(configPath, cfg);
     log(`patched ${configPath} (pre=${preAdded ? "added" : "ok"}, post=${postAdded ? "added" : "ok"}, legacy=${legacyPreRemoved || legacyPostRemoved ? "removed" : "ok"})`);
@@ -181,8 +218,8 @@ function unlinkBin() {
 }
 
 function main() {
-  if (!existsSync(PRE_HOOK) || !existsSync(POST_HOOK)) {
-    throw new Error(`hook scripts not found at ${PRE_HOOK} / ${POST_HOOK}`);
+  if (!existsSync(REPO_PRE_HOOK) || !existsSync(REPO_POST_HOOK)) {
+    throw new Error(`hook scripts not found at ${REPO_PRE_HOOK} / ${REPO_POST_HOOK}`);
   }
 
   installInEngine({

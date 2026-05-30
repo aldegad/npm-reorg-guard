@@ -353,13 +353,67 @@ guard_detect_ecosystem() {
   fi
 }
 
+guard_runner_operands() {
+  # Runner forms (`npx`, `pnpm dlx`, `yarn dlx`) EXECUTE a package; tokens after
+  # the executed package are arguments to that program, NOT package specs. Emit
+  # only the spec-bearing operands: any `-p/--package <pkg>` value plus the first
+  # bare token (the executed package). This stops an argument such as an email
+  # (`dev1@block-s.io`) or a secret value passed to `npx wrangler ...` from being
+  # misread as a `pkg@spec` install.
+  local scan="$1"
+  local after want_value tok
+  after=$(printf '%s' "${scan}" | grep -oiE '(npx|dlx)[[:space:]].*' | head -n1 || true)
+  after="${after#* }"  # drop the runner keyword, keep its operands
+  [[ -z "${after}" ]] && return 0
+
+  want_value=false
+  for tok in ${after}; do
+    if [[ "${want_value}" == true ]]; then
+      printf '%s\n' "${tok}"
+      want_value=false
+      continue
+    fi
+    case "${tok}" in
+      -p|--package) want_value=true ;;
+      --package=*)  printf '%s\n' "${tok#--package=}" ;;
+      -*)           : ;;  # other flag (e.g. -y/--yes), skip
+      *)
+        printf '%s\n' "${tok}"  # executed package; rest are program args
+        break
+        ;;
+    esac
+  done
+}
+
 guard_extract_specs() {
-  # Echo one "pkg<TAB>spec" line per pkg@spec token found in the command.
-  # Captures @scope/name@spec and bare-name@spec forms.
+  # Echo one "pkg<TAB>spec" line per pkg@spec OPERAND genuinely being installed.
+  # Handles @scope/name@spec and bare-name@spec. Two precision rules keep
+  # non-package "@" tokens from being misread as an install:
+  #   1. Runner segments (npx / pnpm dlx / yarn dlx) contribute ONLY their
+  #      executed package — trailing tokens are program arguments, not specs
+  #      (so `npx wrangler ... dev1@block-s.io` is never read as a spec).
+  #   2. Email / host operands (user@domain.tld) are never package specs.
+  # Each shell segment is judged independently so a genuine install in one
+  # segment is still gated even when another segment just runs a tool via npx.
   local cmd="$1"
-  echo "${cmd}" \
+  local seg source=""
+
+  while IFS= read -r seg; do
+    [[ -z "${seg//[[:space:]]/}" ]] && continue
+    if printf '%s' "${seg}" | grep -qEi '(^|[[:space:]])(npx|dlx)([[:space:]]|$)'; then
+      source+="$(guard_runner_operands "${seg}")"$'\n'
+    else
+      source+="${seg}"$'\n'
+    fi
+  done < <(printf '%s\n' "${cmd}" | tr ';|&' '\n')
+
+  printf '%s' "${source}" \
     | grep -oE '(@[a-zA-Z0-9._/-]+/)?[a-zA-Z][a-zA-Z0-9._-]*@[a-zA-Z0-9._^~|<>=*+-]+' \
     | while IFS= read -r token; do
+        # An email / host operand (user@domain.tld) is never a package spec.
+        if [[ "${token}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+          continue
+        fi
         local pkg spec
         if [[ "${token}" =~ ^(@[^@]+)@(.+)$ ]]; then
           pkg="${BASH_REMATCH[1]}"
